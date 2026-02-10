@@ -10,6 +10,8 @@ esp-idf-svc = { version = "0.49", default-features = false, features = ["std", "
 ws2812-esp32-rmt-driver = { version = "0.9", features = ["smart-leds-trait"] }
 smart-leds = "0.4"
 anyhow = "1"
+ssd1306 = "0.9"
+embedded-graphics = "0.8"
 
 [build-dependencies]
 embuild = "0.32"
