@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32-C6 DevKitC-1 — Architecture Overview</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.0/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #232733;
+    --border: #2e3343;
+    --text: #e0e2ea;
+    --text-muted: #8b90a0;
+    --accent: #6c9cfc;
+    --accent2: #a78bfa;
+    --accent3: #34d399;
+    --accent4: #f59e0b;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    padding: 2rem;
+    max-width: 960px;
+    margin: 0 auto;
+  }
+
+  header {
+    text-align: center;
+    padding: 2.5rem 1rem 2rem;
+    margin-bottom: 2rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  header h1 {
+    font-size: 2rem;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    margin-bottom: 0.25rem;
+  }
+
+  header .chip-badge {
+    display: inline-block;
+    background: linear-gradient(135deg, #6c9cfc33, #a78bfa33);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    padding: 0.2rem 0.8rem;
+    border-radius: 20px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    margin-bottom: 1rem;
+  }
+
+  header p {
+    color: var(--text-muted);
+    font-size: 0.95rem;
+    max-width: 600px;
+    margin: 0 auto;
+  }
+
+  .section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.75rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .section h2 {
+    font-size: 1.25rem;
+    font-weight: 600;
+    margin-bottom: 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .section > p {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    margin-bottom: 1.25rem;
+  }
+
+  .mermaid-wrap {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 1.5rem 1rem;
+    margin: 1rem 0;
+    display: flex;
+    justify-content: center;
+    overflow-x: auto;
+  }
+
+  .specs-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1rem;
+    margin-top: 1rem;
+  }
+
+  .spec-card {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 1rem;
+    border-left: 3px solid var(--accent);
+  }
+  .spec-card.radio { border-left-color: var(--accent3); }
+  .spec-card.mem   { border-left-color: var(--accent2); }
+  .spec-card.power { border-left-color: var(--accent4); }
+
+  .spec-card h4 {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--text-muted);
+    margin-bottom: 0.3rem;
+  }
+  .spec-card p { font-size: 0.95rem; font-weight: 500; }
+
+  .diagram-label {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    text-align: center;
+    margin-top: 0.5rem;
+    font-style: italic;
+  }
+
+  .note {
+    background: #6c9cfc10;
+    border: 1px solid #6c9cfc30;
+    border-radius: 8px;
+    padding: 0.85rem 1rem;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    margin-top: 1rem;
+  }
+  .note strong { color: var(--accent); }
+
+  footer {
+    text-align: center;
+    padding: 1.5rem;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    border-top: 1px solid var(--border);
+    margin-top: 1rem;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="chip-badge">RISC-V · Wi-Fi 6 · BLE 5 · 802.15.4</div>
+  <h1>ESP32-C6-DevKitC-1-N8</h1>
+  <p>High-level architecture overview of the Espressif ESP32-C6 system-on-chip and its development board.</p>
+</header>
+
+<!-- SPECS -->
+<div class="section">
+  <h2>📋 Specs at a Glance</h2>
+  <div class="specs-grid">
+    <div class="spec-card">
+      <h4>CPU — High Performance</h4>
+      <p>RISC-V @ 160 MHz</p>
+    </div>
+    <div class="spec-card">
+      <h4>CPU — Low Power</h4>
+      <p>RISC-V @ 20 MHz</p>
+    </div>
+    <div class="spec-card mem">
+      <h4>Flash</h4>
+      <p>8 MB (N8 variant)</p>
+    </div>
+    <div class="spec-card mem">
+      <h4>SRAM</h4>
+      <p>512 KB</p>
+    </div>
+    <div class="spec-card radio">
+      <h4>Wi-Fi</h4>
+      <p>802.11ax (Wi-Fi 6) 2.4 GHz</p>
+    </div>
+    <div class="spec-card radio">
+      <h4>Bluetooth</h4>
+      <p>Bluetooth 5.0 LE</p>
+    </div>
+    <div class="spec-card radio">
+      <h4>802.15.4</h4>
+      <p>Zigbee / Thread / Matter</p>
+    </div>
+    <div class="spec-card power">
+      <h4>Operating Voltage</h4>
+      <p>3.3 V (5 V via USB)</p>
+    </div>
+  </div>
+</div>
+
+<!-- SoC ARCHITECTURE -->
+<div class="section">
+  <h2>🧠 SoC Internal Architecture</h2>
+  <p>The ESP32-C6 contains two RISC-V cores, three radio subsystems, and shared peripherals on a single die.</p>
+  <div class="mermaid-wrap">
+    <pre class="mermaid">
+%%{init: {"theme": "dark"}}%%
+graph TB
+  subgraph CPU["Processing"]
+    HP["HP Core&lt;br/&gt;RISC-V 160 MHz"]
+    LP["LP Core&lt;br/&gt;RISC-V 20 MHz"]
+  end
+
+  subgraph MEM["Memory"]
+    SRAM["512 KB SRAM"]
+    ROM["ROM Bootloader"]
+    FC["Flash Controller"]
+  end
+
+  subgraph RADIO["Radios"]
+    WIFI["Wi-Fi 6&lt;br/&gt;802.11ax"]
+    BTLE["Bluetooth 5 LE"]
+    ZIG["802.15.4&lt;br/&gt;Zigbee / Thread"]
+  end
+
+  subgraph PERIPH["Peripheral Bus"]
+    GPIO["GPIO 30 pins"]
+    COMM["SPI / I2C&lt;br/&gt;I2S / UART"]
+    ADC["12-bit ADC&lt;br/&gt;7 channels"]
+    TMR["Timers / WDT&lt;br/&gt;RTC"]
+    DMA["GDMA&lt;br/&gt;3 channels"]
+  end
+
+  CPU --- BUS{{"Internal Bus"}}
+  MEM --- BUS
+  RADIO --- BUS
+  BUS --- PERIPH
+    </pre>
+  </div>
+  <div class="diagram-label">ESP32-C6 system-on-chip block diagram</div>
+  <div class="note">
+    <strong>Dual-core note:</strong> The high-performance (HP) core runs your application. The low-power (LP) core can keep running during deep sleep for sensor monitoring or wake-on-event, drawing only ~7 µA.
+  </div>
+</div>
+
+<!-- DEV BOARD -->
+<div class="section">
+  <h2>🔧 DevKitC-1 Board Layout</h2>
+  <p>What's physically on the development board and how the components connect.</p>
+  <div class="mermaid-wrap">
+    <pre class="mermaid">
+%%{init: {"theme": "dark"}}%%
+graph LR
+  USB["USB-C Port"] --> BRIDGE["USB-to-UART&lt;br/&gt;Bridge IC"]
+  BRIDGE --> SOC["ESP32-C6&lt;br/&gt;+ 8 MB Flash"]
+  SOC --> ANT["PCB Antenna"]
+
+  VREG["3.3V Regulator"] --> SOC
+  BOOT["BOOT Button"] --> SOC
+  RST["RESET Button"] --> SOC
+  SOC --> LED["RGB LED"]
+  HEADERS["2x Pin Headers"] --> SOC
+    </pre>
+  </div>
+  <div class="diagram-label">DevKitC-1-N8 board component layout</div>
+</div>
+
+<!-- HOST CONNECTION -->
+<div class="section">
+  <h2>💻 Host to Board Connection — Linux</h2>
+  <p>How your development machine talks to the ESP32-C6 during development.</p>
+  <div class="mermaid-wrap">
+    <pre class="mermaid">
+%%{init: {"theme": "dark"}}%%
+graph LR
+  subgraph HOST["Linux Host"]
+    CODE["Rust Code&lt;br/&gt;cargo build"] --> FLASHER["espflash"]
+    MON["Serial Monitor&lt;br/&gt;/dev/ttyUSB0"]
+  end
+
+  subgraph BOARD["DevKitC-1"]
+    UART["USB-UART&lt;br/&gt;Bridge"] --> ESP["ESP32-C6&lt;br/&gt;RISC-V"]
+    ESP --> APP["Your App"]
+  end
+
+  FLASHER -- "USB-C Cable" --> UART
+  MON -. "115200 baud" .-> UART
+    </pre>
+  </div>
+  <div class="diagram-label">Development workflow: build, flash, monitor</div>
+  <div class="note">
+    <strong>Data flow:</strong> Your Rust code compiles to a RISC-V binary on the host. <code>espflash</code> pushes it over USB serial to the chip's bootloader, which writes it to flash. The serial monitor then shows your app's <code>println!</code> output over the same USB connection.
+  </div>
+</div>
+
+<!-- RADIO STACK -->
+<div class="section">
+  <h2>📡 Radio and Protocol Stack</h2>
+  <p>The three radio subsystems and the protocols they enable — this is what makes the C6 special.</p>
+  <div class="mermaid-wrap">
+    <pre class="mermaid">
+%%{init: {"theme": "dark"}}%%
+graph TB
+  subgraph W["Wi-Fi 6 Radio"]
+    W1["802.11 b/g/n/ax&lt;br/&gt;2.4 GHz"]
+    W2["HTTP / MQTT&lt;br/&gt;OTA / Cloud IoT"]
+  end
+
+  subgraph B["Bluetooth 5 LE"]
+    B1["BLE Advertising&lt;br/&gt;GATT / Mesh"]
+    B2["Phone Apps&lt;br/&gt;Sensors&lt;br/&gt;Provisioning"]
+  end
+
+  subgraph I["802.15.4 Radio"]
+    I1["Zigbee 3.0&lt;br/&gt;Thread 1.3"]
+    I2["Smart Home&lt;br/&gt;Matter / Mesh"]
+  end
+
+  W --> COEX["Coexistence Engine&lt;br/&gt;All three radios operate simultaneously"]
+  B --> COEX
+  I --> COEX
+    </pre>
+  </div>
+  <div class="diagram-label">Triple-radio architecture with hardware coexistence</div>
+  <div class="note">
+    <strong>Matter support:</strong> The 802.15.4 radio is why the C6 is one of Espressif's flagship chips for Matter / smart home development. It can act as a Thread border router while simultaneously connected to Wi-Fi — bridging Thread mesh devices to your home network.
+  </div>
+</div>
+
+<!-- MEMORY MAP -->
+<div class="section">
+  <h2>💾 Memory Architecture</h2>
+  <p>How code and data are stored and executed on your N8 variant.</p>
+  <div class="mermaid-wrap">
+    <pre class="mermaid">
+%%{init: {"theme": "dark"}}%%
+graph LR
+  subgraph FLASH["External Flash — 8 MB"]
+    BL["Bootloader&lt;br/&gt;~24 KB"]
+    PT["Partition Table&lt;br/&gt;4 KB"]
+    APPF["Application&lt;br/&gt;Firmware"]
+    NVS["NVS&lt;br/&gt;Key-Value Store"]
+    OTA["OTA Slot&lt;br/&gt;optional"]
+  end
+
+  subgraph SRAMB["Internal SRAM — 512 KB"]
+    IRAM["IRAM&lt;br/&gt;Hot Code Cache"]
+    DRAM["DRAM&lt;br/&gt;Heap / Stack"]
+    RTC["RTC Memory&lt;br/&gt;16 KB&lt;br/&gt;Survives Deep Sleep"]
+  end
+
+  FLASH -- "load at boot" --> SRAMB
+    </pre>
+  </div>
+  <div class="diagram-label">Memory layout — flash stores firmware, SRAM runs it</div>
+  <div class="note">
+    <strong>In practice:</strong> With 8 MB of flash you have plenty of room for OTA (over-the-air) updates with A/B partitions, file systems (LittleFS/SPIFFS), and large application binaries. The 512 KB of SRAM is generous for embedded — most simple to moderate projects won't come close to filling it.
+  </div>
+</div>
+
+<footer>
+  ESP32-C6-DevKitC-1-N8 · Espressif Systems · Architecture Reference
+</footer>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    securityLevel: 'loose'
+  });
+</script>
+</body>
+</html>

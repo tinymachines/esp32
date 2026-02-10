@@ -1,0 +1,24 @@
+[package]
+name = "esp32c6-hello"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+log = { version = "0.4", default-features = false }
+esp-idf-svc = { version = "0.49", default-features = false, features = ["std", "binstart", "native"] }
+ws2812-esp32-rmt-driver = { version = "0.9", features = ["smart-leds-trait"] }
+smart-leds = "0.4"
+anyhow = "1"
+
+[build-dependencies]
+embuild = "0.32"
+
+[profile.release]
+opt-level = "s"    # optimize for size — flash is limited
+lto = "thin"       # link-time optimization
+strip = "symbols"  # strip debug symbols from release binary
+
+[profile.dev]
+debug = true
+opt-level = "z"    # still optimize for size in debug builds

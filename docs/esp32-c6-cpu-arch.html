@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32-C6 — RISC-V CPU Architecture Deep Dive</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.0/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #232733;
+    --border: #2e3343;
+    --text: #e0e2ea;
+    --text-muted: #8b90a0;
+    --accent: #6c9cfc;
+    --accent2: #a78bfa;
+    --accent3: #34d399;
+    --accent4: #f59e0b;
+    --red: #f87171;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    padding: 2rem;
+    max-width: 1000px;
+    margin: 0 auto;
+  }
+
+  header {
+    text-align: center;
+    padding: 2.5rem 1rem 2rem;
+    margin-bottom: 2rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  header h1 { font-size: 2rem; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 0.25rem; }
+
+  header .chip-badge {
+    display: inline-block;
+    background: linear-gradient(135deg, #6c9cfc33, #a78bfa33);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    padding: 0.2rem 0.8rem;
+    border-radius: 20px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    margin-bottom: 1rem;
+  }
+
+  header p { color: var(--text-muted); font-size: 0.95rem; max-width: 640px; margin: 0 auto; }
+
+  .section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.75rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .section h2 {
+    font-size: 1.25rem;
+    font-weight: 600;
+    margin-bottom: 0.75rem;
+  }
+
+  .section h3 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    margin: 1.25rem 0 0.5rem;
+    color: var(--accent);
+  }
+
+  .section > p, .section > div > p {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    margin-bottom: 1rem;
+  }
+
+  .mermaid-wrap {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 1.5rem 1rem;
+    margin: 1rem 0;
+    display: flex;
+    justify-content: center;
+    overflow-x: auto;
+  }
+
+  .diagram-label {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    text-align: center;
+    margin-top: 0.5rem;
+    font-style: italic;
+  }
+
+  .note {
+    background: #6c9cfc10;
+    border: 1px solid #6c9cfc30;
+    border-radius: 8px;
+    padding: 0.85rem 1rem;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    margin-top: 1rem;
+  }
+  .note strong { color: var(--accent); }
+  .note.warn {
+    background: #f59e0b10;
+    border-color: #f59e0b30;
+  }
+  .note.warn strong { color: var(--accent4); }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    font-size: 0.85rem;
+  }
+
+  th, td {
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border);
+    text-align: left;
+  }
+
+  th {
+    background: var(--surface2);
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+  }
+
+  td { color: var(--text); }
+  tr:nth-child(even) td { background: #1e2130; }
+
+  code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+    background: var(--surface2);
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.85em;
+    color: var(--accent3);
+  }
+
+  pre {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 1.25rem;
+    overflow-x: auto;
+    margin: 1rem 0;
+    font-size: 0.82rem;
+    line-height: 1.6;
+  }
+
+  pre code {
+    background: none;
+    padding: 0;
+    color: var(--text);
+  }
+
+  .comment { color: var(--text-muted); }
+  .keyword { color: var(--accent); }
+  .register { color: var(--accent3); }
+  .immediate { color: var(--accent4); }
+  .label { color: var(--accent2); }
+
+  .ext-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1rem;
+    margin: 1rem 0;
+  }
+
+  .ext-card {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 1rem;
+    border-top: 3px solid var(--accent);
+  }
+  .ext-card.m { border-top-color: var(--accent2); }
+  .ext-card.a { border-top-color: var(--accent3); }
+  .ext-card.c { border-top-color: var(--accent4); }
+
+  .ext-card h4 { font-size: 1rem; margin-bottom: 0.25rem; }
+  .ext-card .tag {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    margin-bottom: 0.5rem;
+  }
+  .ext-card p { font-size: 0.85rem; color: var(--text-muted); line-height: 1.5; }
+  .ext-card ul {
+    list-style: none;
+    padding: 0;
+    margin: 0.5rem 0 0;
+    font-size: 0.82rem;
+    color: var(--text-muted);
+  }
+  .ext-card ul li { padding: 0.15rem 0; }
+  .ext-card ul li::before { content: "→ "; color: var(--accent); }
+
+  .bit-field {
+    display: flex;
+    margin: 0.75rem 0;
+    font-size: 0.75rem;
+    font-family: 'JetBrains Mono', monospace;
+    overflow-x: auto;
+  }
+  .bit-field .field {
+    text-align: center;
+    padding: 0.5rem 0.25rem;
+    border: 1px solid var(--border);
+    min-width: 0;
+    flex-shrink: 0;
+  }
+  .bit-field .field .name { font-weight: 600; color: var(--text); }
+  .bit-field .field .bits { color: var(--text-muted); font-size: 0.65rem; }
+  .bit-field .f-op { background: #6c9cfc15; flex: 7; }
+  .bit-field .f-rd { background: #34d39915; flex: 5; }
+  .bit-field .f-f3 { background: #a78bfa15; flex: 3; }
+  .bit-field .f-rs1 { background: #f59e0b15; flex: 5; }
+  .bit-field .f-rs2 { background: #f8717115; flex: 5; }
+  .bit-field .f-f7 { background: #60a5fa15; flex: 7; }
+  .bit-field .f-imm12 { background: #f8717115; flex: 12; }
+  .bit-field .f-imm20 { background: #f8717115; flex: 20; }
+  .bit-field .f-imm5 { background: #f8717115; flex: 5; }
+  .bit-field .f-imm7 { background: #f8717115; flex: 7; }
+
+  .addr-bar {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 1rem 0;
+    font-size: 0.78rem;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .addr-row {
+    display: flex;
+    align-items: stretch;
+  }
+  .addr-range {
+    width: 220px;
+    flex-shrink: 0;
+    padding: 0.4rem 0.5rem;
+    color: var(--text-muted);
+    text-align: right;
+    font-size: 0.72rem;
+  }
+  .addr-block {
+    flex: 1;
+    padding: 0.5rem 0.75rem;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+  .addr-block .name { font-weight: 600; }
+  .addr-block .size { color: rgba(255,255,255,0.6); font-size: 0.7rem; }
+  .ab-irom { background: #6c9cfc25; color: #93b4fc; }
+  .ab-iram { background: #a78bfa25; color: #c4b5fd; }
+  .ab-drom { background: #34d39925; color: #6ee7b7; }
+  .ab-dram { background: #f59e0b25; color: #fcd34d; }
+  .ab-periph { background: #f8717125; color: #fca5a5; }
+  .ab-lp { background: #818cf825; color: #a5b4fc; }
+  .ab-efuse { background: #fb923c25; color: #fdba74; }
+
+  footer {
+    text-align: center;
+    padding: 1.5rem;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    border-top: 1px solid var(--border);
+    margin-top: 1rem;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="chip-badge">RV32IMAC · 32-bit · Little-Endian · Load-Store Architecture</div>
+  <h1>ESP32-C6 RISC-V CPU Architecture</h1>
+  <p>Deep dive into the instruction set, register file, memory addressing, instruction encoding, and assembly language for the ESP32-C6's RISC-V cores.</p>
+</header>
+
+<!-- ======================================================= -->
+<!-- ISA OVERVIEW                                            -->
+<!-- ======================================================= -->
+<div class="section">
+  <h2>🏗️ ISA Overview — RV32IMAC</h2>
+  <p>Both the HP and LP cores in the ESP32-C6 implement the <strong>RV32IMAC</strong> instruction set architecture. This is a modular RISC-V profile built from a base plus three standard extensions.</p>
+
+  <div class="mermaid-wrap">
+    <pre class="mermaid">
+%%{init: {"theme": "dark"}}%%
+graph LR
+  subgraph ISA["RV32IMAC — Full ISA Profile"]
+    I["I&lt;br/&gt;Base Integer&lt;br/&gt;32-bit"]
+    M["M&lt;br/&gt;Multiply&lt;br/&gt;Divide"]
+    A["A&lt;br/&gt;Atomic&lt;br/&gt;Operations"]
+    C["C&lt;br/&gt;Compressed&lt;br/&gt;16-bit Instrs"]
+  end
+
+  RV["RV32&lt;br/&gt;RISC-V&lt;br/&gt;32-bit Base"] --> I
+  I --> M
+  M --> A
+  A --> C
+
+  C --> TARGET["Rust Target:&lt;br/&gt;riscv32imac-&lt;br/&gt;unknown-none-elf"]
+    </pre>
+  </div>
+  <div class="diagram-label">ISA extension chain — each letter adds capabilities</div>
+
+  <div class="ext-grid">
+    <div class="ext-card">
+      <h4>I — Base Integer</h4>
+      <div class="tag">Required Foundation</div>
+      <p>The mandatory base. Provides 32 registers, ALU ops, loads/stores, branches, jumps.</p>
+      <ul>
+        <li>40 base instructions</li>
+        <li>32-bit fixed-width encoding</li>
+        <li>Load-store architecture</li>
+        <li>Byte-addressable, little-endian</li>
+      </ul>
+    </div>
+    <div class="ext-card m">
+      <h4>M — Multiply / Divide</h4>
+      <div class="tag">Standard Extension</div>
+      <p>Hardware integer multiplication and division. Without this, mul/div would be emulated in software.</p>
+      <ul>
+        <li><code>MUL</code>, <code>MULH</code>, <code>MULHU</code>, <code>MULHSU</code></li>
+        <li><code>DIV</code>, <code>DIVU</code></li>
+        <li><code>REM</code>, <code>REMU</code></li>
+      </ul>
+    </div>
+    <div class="ext-card a">
+      <h4>A — Atomics</h4>
+      <div class="tag">Standard Extension</div>
+      <p>Atomic read-modify-write operations. Essential for multi-core synchronization and lock-free data structures.</p>
+      <ul>
+        <li><code>LR.W</code> / <code>SC.W</code> (load-reserved / store-conditional)</li>
+        <li><code>AMOSWAP</code>, <code>AMOADD</code></li>
+        <li><code>AMOAND</code>, <code>AMOOR</code>, <code>AMOXOR</code></li>
+        <li><code>AMOMIN</code>, <code>AMOMAX</code></li>
+      </ul>
+    </div>
+    <div class="ext-card c">
+      <h4>C — Compressed</h4>
+      <div class="tag">Standard Extension</div>
+      <p>16-bit encodings for the most common instructions. Reduces code size by ~25-30% — critical on flash-constrained embedded targets.</p>
+      <ul>
+        <li>16-bit versions of loads, stores, branches</li>
+        <li>Smaller immediate ranges</li>
+        <li>Subset of registers (x8–x15)</li>
+        <li>Instructions like <code>C.LW</code>, <code>C.ADDI</code>, <code>C.J</code></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="note">
+    <strong>What's NOT included:</strong> The ESP32-C6 does <em>not</em> have the F (single-precision float) or D (double-precision float) extensions. All floating-point math is done in software via the compiler's soft-float library. This is typical for embedded MCUs and means <code>f32</code>/<code>f64</code> operations in Rust will be slower than integer math.
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<!-- REGISTER FILE                                           -->
+<!-- ======================================================= -->
+<div class="section">
+  <h2>📋 Register File — 32 × 32-bit GPRs</h2>
+  <p>RISC-V defines 32 general-purpose integer registers (<code>x0</code>–<code>x31</code>), each 32 bits wide. The ABI (Application Binary Interface) gives them conventional names and roles. There are no dedicated floating-point registers on the C6.</p>
+
+  <div class="mermaid-wrap">
+    <pre class="mermaid">
+%%{init: {"theme": "dark"}}%%
+graph TB
+  subgraph SPECIAL["Special Registers"]
+    X0["x0 / zero&lt;br/&gt;Hardwired 0"]
+    RA["x1 / ra&lt;br/&gt;Return Address"]
+    SP["x2 / sp&lt;br/&gt;Stack Pointer"]
+    GP["x3 / gp&lt;br/&gt;Global Pointer"]
+    TP["x4 / tp&lt;br/&gt;Thread Pointer"]
+  end
+
+  subgraph TEMP["Temporaries"]
+    T0["x5-x7 / t0-t2"]
+    T3["x28-x31 / t3-t6"]
+  end
+
+  subgraph SAVED["Saved Registers"]
+    S0["x8 / s0/fp&lt;br/&gt;Frame Ptr / Saved"]
+    S1["x9 / s1"]
+    S2["x18-x27 / s2-s11"]
+  end
+
+  subgraph ARGS["Function Arguments"]
+    A0["x10-x11 / a0-a1&lt;br/&gt;Args + Return Values"]
+    A2["x12-x17 / a2-a7&lt;br/&gt;Arguments"]
+  end
+
+  subgraph OTHER["Control"]
+    PC["pc&lt;br/&gt;Program Counter&lt;br/&gt;(not in GPR file)"]
+    CSR["CSRs&lt;br/&gt;mstatus, mtvec,&lt;br/&gt;mcause, etc."]
+  end
+    </pre>
+  </div>
+  <div class="diagram-label">Register file organization by ABI convention</div>
+
+  <table>
+    <thead>
+      <tr><th>Register</th><th>ABI Name</th><th>Role</th><th>Caller/Callee Saved</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>x0</code></td><td><code>zero</code></td><td>Hardwired zero — reads always return 0, writes are discarded</td><td>—</td></tr>
+      <tr><td><code>x1</code></td><td><code>ra</code></td><td>Return address (set by <code>JAL</code>/<code>JALR</code>)</td><td>Caller</td></tr>
+      <tr><td><code>x2</code></td><td><code>sp</code></td><td>Stack pointer</td><td>Callee</td></tr>
+      <tr><td><code>x3</code></td><td><code>gp</code></td><td>Global pointer (linker-relaxation base)</td><td>—</td></tr>
+      <tr><td><code>x4</code></td><td><code>tp</code></td><td>Thread pointer</td><td>—</td></tr>
+      <tr><td><code>x5–x7</code></td><td><code>t0–t2</code></td><td>Temporary registers</td><td>Caller</td></tr>
+      <tr><td><code>x8</code></td><td><code>s0</code> / <code>fp</code></td><td>Saved register / frame pointer</td><td>Callee</td></tr>
+      <tr><td><code>x9</code></td><td><code>s1</code></td><td>Saved register</td><td>Callee</td></tr>
+      <tr><td><code>x10–x11</code></td><td><code>a0–a1</code></td><td>Function arguments + return values</td><td>Caller</td></tr>
+      <tr><td><code>x12–x17</code></td><td><code>a2–a7</code></td><td>Function arguments</td><td>Caller</td></tr>
+      <tr><td><code>x18–x27</code></td><td><code>s2–s11</code></td><td>Saved registers</td><td>Callee</td></tr>
+      <tr><td><code>x28–x31</code></td><td><code>t3–t6</code></td><td>Temporary registers</td><td>Caller</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <strong>Caller vs Callee saved:</strong> "Caller saved" means the calling function must save these registers before a function call if it needs them afterwards. "Callee saved" means the called function must preserve them. This is a convention enforced by the compiler — the hardware doesn't care.
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<!-- INSTRUCTION FORMATS                                     -->
+<!-- ======================================================= -->
+<div class="section">
+  <h2>🔢 Instruction Encoding Formats</h2>
+  <p>RV32I defines six core instruction formats. All are exactly 32 bits wide (the C extension adds 16-bit variants). The source and destination register fields are always in the same bit positions across formats to simplify decoding.</p>
+
+  <h3>R-Type — Register-to-Register</h3>
+  <p>Used for ALU operations between two source registers. Example: <code>ADD rd, rs1, rs2</code></p>
+  <div class="bit-field">
+    <div class="field f-f7"><div class="name">funct7</div><div class="bits">31:25</div></div>
+    <div class="field f-rs2"><div class="name">rs2</div><div class="bits">24:20</div></div>
+    <div class="field f-rs1"><div class="name">rs1</div><div class="bits">19:15</div></div>
+    <div class="field f-f3"><div class="name">f3</div><div class="bits">14:12</div></div>
+    <div class="field f-rd"><div class="name">rd</div><div class="bits">11:7</div></div>
+    <div class="field f-op"><div class="name">opcode</div><div class="bits">6:0</div></div>
+  </div>
+
+  <h3>I-Type — Immediate</h3>
+  <p>Used for loads, ALU with immediate, and <code>JALR</code>. 12-bit sign-extended immediate. Example: <code>ADDI rd, rs1, imm</code></p>
+  <div class="bit-field">
+    <div class="field f-imm12"><div class="name">imm[11:0]</div><div class="bits">31:20</div></div>
+    <div class="field f-rs1"><div class="name">rs1</div><div class="bits">19:15</div></div>
+    <div class="field f-f3"><div class="name">f3</div><div class="bits">14:12</div></div>
+    <div class="field f-rd"><div class="name">rd</div><div class="bits">11:7</div></div>
+    <div class="field f-op"><div class="name">opcode</div><div class="bits">6:0</div></div>
+  </div>
+
+  <h3>S-Type — Store</h3>
+  <p>Used for storing register data to memory. The immediate is split across two fields. Example: <code>SW rs2, offset(rs1)</code></p>
+  <div class="bit-field">
+    <div class="field f-imm7"><div class="name">imm[11:5]</div><div class="bits">31:25</div></div>
+    <div class="field f-rs2"><div class="name">rs2</div><div class="bits">24:20</div></div>
+    <div class="field f-rs1"><div class="name">rs1</div><div class="bits">19:15</div></div>
+    <div class="field f-f3"><div class="name">f3</div><div class="bits">14:12</div></div>
+    <div class="field f-imm5"><div class="name">imm[4:0]</div><div class="bits">11:7</div></div>
+    <div class="field f-op"><div class="name">opcode</div><div class="bits">6:0</div></div>
+  </div>
+
+  <h3>B-Type — Branch</h3>
+  <p>Conditional branches. PC-relative, 12-bit immediate (shifted left by 1, giving ±4 KiB range). Example: <code>BEQ rs1, rs2, label</code></p>
+  <div class="bit-field">
+    <div class="field f-imm7"><div class="name">imm[12|10:5]</div><div class="bits">31:25</div></div>
+    <div class="field f-rs2"><div class="name">rs2</div><div class="bits">24:20</div></div>
+    <div class="field f-rs1"><div class="name">rs1</div><div class="bits">19:15</div></div>
+    <div class="field f-f3"><div class="name">f3</div><div class="bits">14:12</div></div>
+    <div class="field f-imm5"><div class="name">imm[4:1|11]</div><div class="bits">11:7</div></div>
+    <div class="field f-op"><div class="name">opcode</div><div class="bits">6:0</div></div>
+  </div>
+
+  <h3>U-Type — Upper Immediate</h3>
+  <p>Loads a 20-bit immediate into the upper bits of a register. Used with <code>LUI</code> and <code>AUIPC</code> to build 32-bit constants and addresses.</p>
+  <div class="bit-field">
+    <div class="field f-imm20"><div class="name">imm[31:12]</div><div class="bits">31:12</div></div>
+    <div class="field f-rd"><div class="name">rd</div><div class="bits">11:7</div></div>
+    <div class="field f-op"><div class="name">opcode</div><div class="bits">6:0</div></div>
+  </div>
+
+  <h3>J-Type — Jump</h3>
+  <p>Unconditional jump (<code>JAL</code>). 20-bit PC-relative immediate (shifted left by 1, giving ±1 MiB range).</p>
+  <div class="bit-field">
+    <div class="field f-imm20"><div class="name">imm[20|10:1|11|19:12]</div><div class="bits">31:12</div></div>
+    <div class="field f-rd"><div class="name">rd</div><div class="bits">11:7</div></div>
+    <div class="field f-op"><div class="name">opcode</div><div class="bits">6:0</div></div>
+  </div>
+
+  <div class="note">
+    <strong>Key design principle:</strong> The sign bit of every immediate is <em>always</em> in bit 31 of the instruction word. This lets the sign-extension circuit start working before the rest of the instruction is decoded — a classic RISC-V speed trick.
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<!-- ADDRESSING MODES                                        -->
+<!-- ======================================================= -->
+<div class="section">
+  <h2>📍 Memory Addressing</h2>
+  <p>RISC-V is a strict <strong>load-store architecture</strong>: only load and store instructions access memory. All arithmetic operates exclusively on registers. The ESP32-C6 uses a 32-bit address space (4 GiB) with <strong>little-endian</strong> byte ordering.</p>
+
+  <div class="mermaid-wrap">
+    <pre class="mermaid">
+%%{init: {"theme": "dark"}}%%
+graph LR
+  subgraph MODES["Addressing Modes"]
+    REG["Register Direct&lt;br/&gt;ADD rd, rs1, rs2&lt;br/&gt;Operands in registers"]
+    IMM["Immediate&lt;br/&gt;ADDI rd, rs1, 123&lt;br/&gt;12-bit constant"]
+    BASE["Base + Offset&lt;br/&gt;LW rd, offset(rs1)&lt;br/&gt;Loads and stores"]
+    PC_REL["PC-Relative&lt;br/&gt;JAL / branches&lt;br/&gt;Relative to current PC"]
+    UPPER["Upper Immediate&lt;br/&gt;LUI rd, imm20&lt;br/&gt;20-bit into upper bits"]
+  end
+    </pre>
+  </div>
+  <div class="diagram-label">The five addressing modes available in RISC-V</div>
+
+  <table>
+    <thead>
+      <tr><th>Mode</th><th>Syntax</th><th>Address Calculation</th><th>Range</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Base + Offset</td>
+        <td><code>LW rd, imm(rs1)</code></td>
+        <td>addr = rs1 + sign_extend(imm12)</td>
+        <td>±2 KiB from base register</td>
+      </tr>
+      <tr>
+        <td>PC-Relative (branch)</td>
+        <td><code>BEQ rs1, rs2, label</code></td>
+        <td>addr = PC + sign_extend(imm13)</td>
+        <td>±4 KiB from PC</td>
+      </tr>
+      <tr>
+        <td>PC-Relative (jump)</td>
+        <td><code>JAL rd, label</code></td>
+        <td>addr = PC + sign_extend(imm21)</td>
+        <td>±1 MiB from PC</td>
+      </tr>
+      <tr>
+        <td>Indirect (jump)</td>
+        <td><code>JALR rd, rs1, imm</code></td>
+        <td>addr = (rs1 + sign_extend(imm12)) &amp; ~1</td>
+        <td>Full 32-bit space</td>
+      </tr>
+      <tr>
+        <td>Upper Immediate</td>
+        <td><code>LUI rd, imm20</code></td>
+        <td>rd = imm20 &lt;&lt; 12</td>
+        <td>Upper 20 bits of 32-bit constant</td>
+      </tr>
+      <tr>
+        <td>PC + Upper Immediate</td>
+        <td><code>AUIPC rd, imm20</code></td>
+        <td>rd = PC + (imm20 &lt;&lt; 12)</td>
+        <td>±2 GiB from PC</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Building a Full 32-bit Address</h3>
+  <p>Since immediates max out at 20 bits, loading a full 32-bit address or constant takes two instructions:</p>
+  <pre><code><span class="comment"># Load the 32-bit address 0x4080_1234 into register t0</span>
+<span class="keyword">LUI</span>   <span class="register">t0</span>, <span class="immediate">0x40802</span>       <span class="comment"># t0 = 0x40802000 (upper 20 bits, rounded for sign extension)</span>
+<span class="keyword">ADDI</span>  <span class="register">t0</span>, <span class="register">t0</span>, <span class="immediate">0x234</span>    <span class="comment"># t0 = 0x40801234 (add lower 12 bits)</span></code></pre>
+
+  <h3>Load and Store Widths</h3>
+  <table>
+    <thead>
+      <tr><th>Instruction</th><th>Width</th><th>Sign Extension</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>LB</code> / <code>SB</code></td><td>8-bit (byte)</td><td>Sign-extended on load</td></tr>
+      <tr><td><code>LBU</code></td><td>8-bit (byte)</td><td>Zero-extended</td></tr>
+      <tr><td><code>LH</code> / <code>SH</code></td><td>16-bit (halfword)</td><td>Sign-extended on load</td></tr>
+      <tr><td><code>LHU</code></td><td>16-bit (halfword)</td><td>Zero-extended</td></tr>
+      <tr><td><code>LW</code> / <code>SW</code></td><td>32-bit (word)</td><td>Full register width</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <strong>Alignment:</strong> The base RISC-V spec allows misaligned loads/stores, but they may trap. On the ESP32-C6, aligned accesses are fastest. 32-bit loads/stores should be word-aligned (address divisible by 4), 16-bit by 2.
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<!-- MEMORY MAP                                              -->
+<!-- ======================================================= -->
+<div class="section">
+  <h2>🗺️ ESP32-C6 Address Space Map</h2>
+  <p>The ESP32-C6 uses a <strong>Harvard-like</strong> bus architecture internally — separate instruction and data buses — but presents a unified 32-bit address space to the programmer. External flash is accessed through an MMU cache with 64 KB page granularity.</p>
+
+  <div class="mermaid-wrap">
+    <pre class="mermaid">
+%%{init: {"theme": "dark"}}%%
+graph TB
+  subgraph CPU["HP Core — RISC-V"]
+    IBUS["Instruction Bus"]
+    DBUS["Data Bus"]
+  end
+
+  subgraph CACHE["MMU / Cache"]
+    ICACHE["I-Cache"]
+    DCACHE["D-Cache"]
+  end
+
+  subgraph MEMORY["Memory Targets"]
+    IRAM["IRAM&lt;br/&gt;Internal SRAM"]
+    DRAM["DRAM&lt;br/&gt;Internal SRAM"]
+    FLASH["External Flash&lt;br/&gt;8 MB via SPI"]
+    PERIPH["Peripherals&lt;br/&gt;Memory-Mapped I/O"]
+    LP_MEM["LP SRAM&lt;br/&gt;16 KB"]
+  end
+
+  IBUS --> ICACHE
+  DBUS --> DCACHE
+  ICACHE --> IRAM
+  ICACHE --> FLASH
+  DCACHE --> DRAM
+  DCACHE --> FLASH
+  DBUS --> PERIPH
+  DBUS --> LP_MEM
+    </pre>
+  </div>
+  <div class="diagram-label">Harvard bus architecture with cache-mediated flash access</div>
+
+  <h3>Address Regions</h3>
+  <div class="addr-bar">
+    <div class="addr-row">
+      <div class="addr-range">0x4000_0000 – 0x407F_FFFF</div>
+      <div class="addr-block ab-irom"><span class="name">IROM — Flash mapped for instruction execution</span><span class="size">8 MB</span></div>
+    </div>
+    <div class="addr-row">
+      <div class="addr-range">0x4080_0000 – 0x4087_FFFF</div>
+      <div class="addr-block ab-iram"><span class="name">IRAM — Internal SRAM (executable)</span><span class="size">512 KB</span></div>
+    </div>
+    <div class="addr-row">
+      <div class="addr-range">0x4200_0000 – 0x427F_FFFF</div>
+      <div class="addr-block ab-drom"><span class="name">DROM — Flash mapped for data reads (const)</span><span class="size">8 MB</span></div>
+    </div>
+    <div class="addr-row">
+      <div class="addr-range">0x4080_0000 – 0x4087_FFFF</div>
+      <div class="addr-block ab-dram"><span class="name">DRAM — Internal SRAM (data, heap, stack)</span><span class="size">512 KB (shared with IRAM)</span></div>
+    </div>
+    <div class="addr-row">
+      <div class="addr-range">0x6000_0000 – 0x600F_FFFF</div>
+      <div class="addr-block ab-periph"><span class="name">Peripheral Registers — memory-mapped I/O</span><span class="size">~1 MB</span></div>
+    </div>
+    <div class="addr-row">
+      <div class="addr-range">0x5000_0000 – 0x5000_3FFF</div>
+      <div class="addr-block ab-lp"><span class="name">LP SRAM — Low-power memory (survives deep sleep)</span><span class="size">16 KB</span></div>
+    </div>
+    <div class="addr-row">
+      <div class="addr-range">0x600B_0800 – 0x600B_0FFF</div>
+      <div class="addr-block ab-efuse"><span class="name">eFuse — One-time-programmable config bits</span><span class="size">4096 bits</span></div>
+    </div>
+  </div>
+
+  <div class="note">
+    <strong>IRAM/DRAM sharing:</strong> The internal 512 KB SRAM is mapped to both instruction and data buses at the same physical address range. The linker splits it — code that must be in RAM (ISR handlers, hot functions) goes in the IRAM section, and everything else (heap, stack, .data, .bss) goes into DRAM. More IRAM usage means less DRAM and vice versa.
+  </div>
+
+  <div class="note warn">
+    <strong>Peripheral access:</strong> All peripheral registers (GPIO, SPI, UART, timers, etc.) are memory-mapped at <code>0x6000_0000</code>+. In Rust, the HAL crates abstract this, but at the bare metal level you're reading/writing these addresses with volatile pointer operations. Each peripheral block occupies a 4 KB page.
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<!-- ASSEMBLY EXAMPLES                                       -->
+<!-- ======================================================= -->
+<div class="section">
+  <h2>📝 RISC-V Assembly on the ESP32-C6</h2>
+  <p>The ESP32-C6 uses standard RISC-V GNU assembler syntax. Below are examples of what the compiler generates and what you might write in inline assembly from Rust.</p>
+
+  <h3>Basic ALU and Control Flow</h3>
+  <pre><code><span class="comment"># Simple loop: sum integers 1 to 10</span>
+      <span class="keyword">li</span>    <span class="register">a0</span>, <span class="immediate">0</span>           <span class="comment"># a0 = sum = 0 (pseudo: expands to ADDI a0, zero, 0)</span>
+      <span class="keyword">li</span>    <span class="register">a1</span>, <span class="immediate">1</span>           <span class="comment"># a1 = counter = 1</span>
+      <span class="keyword">li</span>    <span class="register">a2</span>, <span class="immediate">11</span>          <span class="comment"># a2 = limit = 11</span>
+<span class="label">loop:</span>
+      <span class="keyword">add</span>   <span class="register">a0</span>, <span class="register">a0</span>, <span class="register">a1</span>    <span class="comment"># sum += counter        (R-type)</span>
+      <span class="keyword">addi</span>  <span class="register">a1</span>, <span class="register">a1</span>, <span class="immediate">1</span>     <span class="comment"># counter++              (I-type)</span>
+      <span class="keyword">blt</span>   <span class="register">a1</span>, <span class="register">a2</span>, <span class="label">loop</span>  <span class="comment"># if counter < limit, branch (B-type)</span>
+      <span class="keyword">ret</span>                    <span class="comment"># return (pseudo: JALR zero, ra, 0)</span></code></pre>
+
+  <h3>Memory Access</h3>
+  <pre><code><span class="comment"># Read a 32-bit peripheral register (GPIO output register)</span>
+      <span class="keyword">lui</span>   <span class="register">t0</span>, <span class="immediate">0x60004</span>    <span class="comment"># t0 = 0x60004000 (GPIO base)    (U-type)</span>
+      <span class="keyword">lw</span>    <span class="register">t1</span>, <span class="immediate">0x04</span>(<span class="register">t0</span>)   <span class="comment"># t1 = *(t0 + 4)  read GPIO_OUT  (I-type load)</span>
+
+<span class="comment"># Write a value to memory</span>
+      <span class="keyword">li</span>    <span class="register">t2</span>, <span class="immediate">0xFF</span>        <span class="comment"># value to write</span>
+      <span class="keyword">sw</span>    <span class="register">t2</span>, <span class="immediate">0x08</span>(<span class="register">t0</span>)   <span class="comment"># *(t0 + 8) = t2  (S-type store)</span>
+
+<span class="comment"># Byte-level access (reading a sensor byte)</span>
+      <span class="keyword">lbu</span>   <span class="register">a0</span>, <span class="immediate">0</span>(<span class="register">a1</span>)     <span class="comment"># load unsigned byte from address in a1</span></code></pre>
+
+  <h3>Function Call Convention</h3>
+  <pre><code><span class="comment"># Calling a function: args in a0-a7, return in a0/a1</span>
+<span class="label">my_func:</span>
+      <span class="keyword">addi</span>  <span class="register">sp</span>, <span class="register">sp</span>, <span class="immediate">-16</span>   <span class="comment"># allocate 16 bytes on stack</span>
+      <span class="keyword">sw</span>    <span class="register">ra</span>, <span class="immediate">12</span>(<span class="register">sp</span>)    <span class="comment"># save return address</span>
+      <span class="keyword">sw</span>    <span class="register">s0</span>, <span class="immediate">8</span>(<span class="register">sp</span>)     <span class="comment"># save callee-saved register</span>
+
+      <span class="keyword">mv</span>    <span class="register">s0</span>, <span class="register">a0</span>        <span class="comment"># preserve arg across call (pseudo: ADDI s0, a0, 0)</span>
+      <span class="keyword">jal</span>   <span class="register">ra</span>, <span class="label">other_fn</span>  <span class="comment"># call other_fn (J-type, saves PC+4 in ra)</span>
+
+      <span class="keyword">add</span>   <span class="register">a0</span>, <span class="register">a0</span>, <span class="register">s0</span>   <span class="comment"># combine return value with saved arg</span>
+      <span class="keyword">lw</span>    <span class="register">s0</span>, <span class="immediate">8</span>(<span class="register">sp</span>)     <span class="comment"># restore s0</span>
+      <span class="keyword">lw</span>    <span class="register">ra</span>, <span class="immediate">12</span>(<span class="register">sp</span>)    <span class="comment"># restore return address</span>
+      <span class="keyword">addi</span>  <span class="register">sp</span>, <span class="register">sp</span>, <span class="immediate">16</span>    <span class="comment"># deallocate stack</span>
+      <span class="keyword">ret</span>                    <span class="comment"># return to caller</span></code></pre>
+
+  <h3>Atomic Operations (A Extension)</h3>
+  <pre><code><span class="comment"># Atomic increment of a shared counter at address in a0</span>
+<span class="label">retry:</span>
+      <span class="keyword">lr.w</span>  <span class="register">t0</span>, (<span class="register">a0</span>)       <span class="comment"># load-reserved: t0 = *a0, set reservation</span>
+      <span class="keyword">addi</span>  <span class="register">t0</span>, <span class="register">t0</span>, <span class="immediate">1</span>     <span class="comment"># increment</span>
+      <span class="keyword">sc.w</span>  <span class="register">t1</span>, <span class="register">t0</span>, (<span class="register">a0</span>)  <span class="comment"># store-conditional: *a0 = t0 if reservation held</span>
+      <span class="keyword">bnez</span>  <span class="register">t1</span>, <span class="label">retry</span>     <span class="comment"># t1 != 0 means SC failed, retry</span></code></pre>
+
+  <h3>Compressed Instructions (C Extension)</h3>
+  <pre><code><span class="comment"># These 16-bit compressed instructions are encoded by the assembler</span>
+<span class="comment"># automatically when possible. Same semantics, half the size:</span>
+      <span class="keyword">c.li</span>   <span class="register">a0</span>, <span class="immediate">5</span>         <span class="comment"># 16-bit: load immediate 5 into a0</span>
+      <span class="keyword">c.addi</span> <span class="register">sp</span>, <span class="immediate">-16</span>      <span class="comment"># 16-bit: adjust stack pointer</span>
+      <span class="keyword">c.lw</span>   <span class="register">a1</span>, <span class="immediate">0</span>(<span class="register">a0</span>)    <span class="comment"># 16-bit: load word (registers x8-x15 only)</span>
+      <span class="keyword">c.sw</span>   <span class="register">a1</span>, <span class="immediate">4</span>(<span class="register">a0</span>)    <span class="comment"># 16-bit: store word</span>
+      <span class="keyword">c.j</span>    <span class="label">loop</span>           <span class="comment"># 16-bit: unconditional jump</span>
+      <span class="keyword">c.ret</span>                  <span class="comment"># 16-bit: return (JALR zero, ra, 0)</span></code></pre>
+
+  <div class="note">
+    <strong>Inline assembly in Rust:</strong> You can use RISC-V assembly directly in Rust via <code>core::arch::asm!</code>. Example: <code>unsafe { core::arch::asm!("csrr {}, mhartid", out(reg) hart_id) }</code>. The Rust compiler itself emits RV32IMAC assembly — you can inspect it with <code>cargo objdump --release -- -d</code>.
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<!-- PSEUDO-INSTRUCTIONS                                     -->
+<!-- ======================================================= -->
+<div class="section">
+  <h2>🔀 Common Pseudo-Instructions</h2>
+  <p>The assembler provides many "pseudo-instructions" that expand into one or more real instructions. These make assembly more readable without adding hardware complexity.</p>
+
+  <table>
+    <thead>
+      <tr><th>Pseudo</th><th>Expands To</th><th>Purpose</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>NOP</code></td><td><code>ADDI x0, x0, 0</code></td><td>No operation</td></tr>
+      <tr><td><code>LI rd, imm</code></td><td><code>LUI</code> + <code>ADDI</code></td><td>Load arbitrary 32-bit immediate</td></tr>
+      <tr><td><code>LA rd, symbol</code></td><td><code>AUIPC</code> + <code>ADDI</code></td><td>Load address of symbol</td></tr>
+      <tr><td><code>MV rd, rs</code></td><td><code>ADDI rd, rs, 0</code></td><td>Register-to-register move</td></tr>
+      <tr><td><code>NOT rd, rs</code></td><td><code>XORI rd, rs, -1</code></td><td>Bitwise NOT</td></tr>
+      <tr><td><code>NEG rd, rs</code></td><td><code>SUB rd, x0, rs</code></td><td>Negate (two's complement)</td></tr>
+      <tr><td><code>J offset</code></td><td><code>JAL x0, offset</code></td><td>Unconditional jump (discard return addr)</td></tr>
+      <tr><td><code>JR rs</code></td><td><code>JALR x0, rs, 0</code></td><td>Jump to register (indirect)</td></tr>
+      <tr><td><code>RET</code></td><td><code>JALR x0, ra, 0</code></td><td>Return from function</td></tr>
+      <tr><td><code>CALL fn</code></td><td><code>AUIPC ra</code> + <code>JALR ra</code></td><td>Far function call</td></tr>
+      <tr><td><code>BEQZ rs, off</code></td><td><code>BEQ rs, x0, off</code></td><td>Branch if zero</td></tr>
+      <tr><td><code>BNEZ rs, off</code></td><td><code>BNE rs, x0, off</code></td><td>Branch if not zero</td></tr>
+      <tr><td><code>SEQZ rd, rs</code></td><td><code>SLTIU rd, rs, 1</code></td><td>Set if equal to zero</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <strong>Why pseudo-instructions matter:</strong> RISC-V deliberately keeps the hardware instruction set minimal. Instead of <code>MOV</code>, <code>NOP</code>, or <code>NOT</code> instructions in silicon, the assembler synthesizes them from existing ops. This keeps the decoder simple and the chip small — ideal for a low-cost embedded MCU.
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<!-- CSR & PRIVILEGE                                         -->
+<!-- ======================================================= -->
+<div class="section">
+  <h2>🔐 Privilege Levels and Control/Status Registers</h2>
+  <p>The ESP32-C6 HP core implements RISC-V Machine mode (M-mode) and optionally User mode. When running under ESP-IDF (FreeRTOS), the RTOS kernel runs in M-mode and tasks can run in U-mode when the Trusted Execution Environment (TEE) is enabled.</p>
+
+  <div class="mermaid-wrap">
+    <pre class="mermaid">
+%%{init: {"theme": "dark"}}%%
+graph TB
+  M["M-Mode&lt;br/&gt;Machine Mode&lt;br/&gt;Full hardware access&lt;br/&gt;Interrupt handling&lt;br/&gt;CSR access"] --> U["U-Mode&lt;br/&gt;User Mode&lt;br/&gt;Restricted access&lt;br/&gt;Application tasks&lt;br/&gt;TEE isolation"]
+
+  M --> CSR["Key CSRs"]
+
+  subgraph CSRS["Control / Status Registers"]
+    MSTATUS["mstatus&lt;br/&gt;Global interrupt enable,&lt;br/&gt;privilege stack"]
+    MTVEC["mtvec&lt;br/&gt;Trap vector base address"]
+    MCAUSE["mcause&lt;br/&gt;Exception / interrupt cause"]
+    MEPC["mepc&lt;br/&gt;Return address after trap"]
+    MIE["mie / mip&lt;br/&gt;Interrupt enable / pending"]
+    MCYCLE["mcycle / minstret&lt;br/&gt;Performance counters"]
+  end
+
+  CSR --> MSTATUS
+  CSR --> MTVEC
+  CSR --> MCAUSE
+  CSR --> MEPC
+  CSR --> MIE
+  CSR --> MCYCLE
+    </pre>
+  </div>
+  <div class="diagram-label">Privilege levels and key control/status registers</div>
+
+  <h3>CSR Access Instructions</h3>
+  <table>
+    <thead>
+      <tr><th>Instruction</th><th>Operation</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>CSRRW rd, csr, rs1</code></td><td>Atomic read CSR into rd, write rs1 into CSR</td></tr>
+      <tr><td><code>CSRRS rd, csr, rs1</code></td><td>Read CSR into rd, set bits specified by rs1</td></tr>
+      <tr><td><code>CSRRC rd, csr, rs1</code></td><td>Read CSR into rd, clear bits specified by rs1</td></tr>
+      <tr><td><code>CSRRWI</code>, <code>CSRRSI</code>, <code>CSRRCI</code></td><td>Same as above but with 5-bit immediate instead of register</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <strong>Debug support:</strong> The ESP32-C6 includes a RISC-V Debug Module (v0.13 compliant) accessible via JTAG over the USB interface. This supports hardware breakpoints (up to 4 triggers), single-stepping, and a trace encoder for instruction tracing — all usable from tools like OpenOCD and <code>espflash</code>.
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<!-- RUST TOOLCHAIN MAPPING                                  -->
+<!-- ======================================================= -->
+<div class="section">
+  <h2>🦀 Rust Toolchain Mapping</h2>
+  <p>How the ISA maps to the Rust compilation target and what it means for your code.</p>
+
+  <div class="mermaid-wrap">
+    <pre class="mermaid">
+%%{init: {"theme": "dark"}}%%
+graph LR
+  RUST["Rust Source&lt;br/&gt;.rs files"] --> LLVM["LLVM Backend&lt;br/&gt;riscv32 target"]
+  LLVM --> ASM["RISC-V Assembly&lt;br/&gt;RV32IMAC instructions"]
+  ASM --> OBJ["Object Files&lt;br/&gt;.o ELF32"]
+  OBJ --> LINK["Linker&lt;br/&gt;rust-lld"]
+  LINK --> BIN["Firmware Binary&lt;br/&gt;ELF / .bin"]
+  BIN --> FLASH["espflash&lt;br/&gt;writes to&lt;br/&gt;ESP32-C6 flash"]
+    </pre>
+  </div>
+  <div class="diagram-label">Compilation pipeline from Rust source to flashed firmware</div>
+
+  <table>
+    <thead>
+      <tr><th>Property</th><th>Value</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Rust target triple</td><td><code>riscv32imac-unknown-none-elf</code></td></tr>
+      <tr><td>Architecture</td><td>RV32IMAC (32-bit RISC-V with M, A, C extensions)</td></tr>
+      <tr><td>Endianness</td><td>Little-endian</td></tr>
+      <tr><td>ABI</td><td><code>ilp32</code> (int, long, pointer = 32-bit, soft-float)</td></tr>
+      <tr><td>Float support</td><td>Software only (no F/D extensions)</td></tr>
+      <tr><td>Atomic support</td><td>Hardware (<code>core::sync::atomic</code> works natively via A extension)</td></tr>
+      <tr><td>Pointer width</td><td>32-bit (4 bytes)</td></tr>
+      <tr><td>Linker</td><td><code>rust-lld</code> (LLVM's LLD linker)</td></tr>
+      <tr><td>Object format</td><td>ELF32-littleriscv</td></tr>
+      <tr><td><code>#[no_std]</code></td><td>Required for bare-metal; <code>std</code> available with ESP-IDF</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <strong>Inspecting generated assembly:</strong> Use <code>cargo objdump --release -- -d</code> to disassemble your firmware and see exactly what RISC-V instructions the compiler produced. You'll see a mix of 32-bit and 16-bit (compressed) instructions — the compiler uses C-extension encodings automatically whenever possible to reduce code size.
+  </div>
+</div>
+
+<footer>
+  ESP32-C6-DevKitC-1-N8 · RV32IMAC RISC-V Architecture Reference<br/>
+  Sources: RISC-V ISA Specification (v20191213) · ESP32-C6 Technical Reference Manual · ESP32-C6 Datasheet v1.3
+</footer>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    securityLevel: 'loose'
+  });
+</script>
+</body>
+</html>
