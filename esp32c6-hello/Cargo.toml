@@ -17,7 +17,7 @@ embedded-graphics = "0.8"
 embuild = "0.32"
 
 [profile.release]
-opt-level = "s"    # optimize for size — flash is limited
+opt-level = "z"    # optimize aggressively for size — flash is limited
 lto = "thin"       # link-time optimization
 strip = "symbols"  # strip debug symbols from release binary
 
