@@ -36,4 +36,16 @@ echo "Pushed to remote."
 # 4. Flash
 echo "Building and flashing..."
 source ~/export-esp.sh
-cargo espflash flash --release --monitor
+
+# Auto-detect serial port
+if [ -e /dev/ttyACM0 ]; then
+    PORT=/dev/ttyACM0
+elif [ -e /dev/ttyUSB0 ]; then
+    PORT=/dev/ttyUSB0
+else
+    echo "Error: No serial device found at /dev/ttyACM0 or /dev/ttyUSB0"
+    exit 1
+fi
+echo "Using port: $PORT"
+
+cargo espflash flash --release --monitor --port "$PORT"
