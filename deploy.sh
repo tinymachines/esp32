@@ -23,7 +23,8 @@ IFS='.' read -r major minor patch <<< "$current"
 patch=$((patch + 1))
 new_version="$major.$minor.$patch"
 sed -i "s/^version = \"$current\"/version = \"$new_version\"/" Cargo.toml
-git -C .. add esp32c6-hello/Cargo.toml
+sed -i "s/^version = \"$current\"/version = \"$new_version\"/" Cargo.lock
+git -C .. add esp32c6-hello/Cargo.toml esp32c6-hello/Cargo.lock
 git -C .. commit -m "Bump version to v$new_version"
 git -C .. tag "v$new_version"
 echo "Bumped $current -> $new_version"
