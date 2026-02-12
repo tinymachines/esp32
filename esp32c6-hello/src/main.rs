@@ -24,28 +24,10 @@ fn main() -> anyhow::Result<()> {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     let peripherals = Peripherals::take()?;
-    let sysloop = EspSystemEventLoop::take()?;
-    let nvs = EspDefaultNvsPartition::take()?;
 
-    // WiFi setup
-    let mut wifi = BlockingWifi::wrap(EspWifi::new(peripherals.modem, sysloop.clone(), Some(nvs))?, sysloop)?;
-
-    wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-        ssid: WIFI_SSID.try_into().map_err(|_| anyhow::anyhow!("SSID too long"))?,
-        password: WIFI_PASS.try_into().map_err(|_| anyhow::anyhow!("Password too long"))?,
-        auth_method: AuthMethod::WPA2Personal,
-        ..Default::default()
-    }))?;
-
-    wifi.start()?;
-    log::info!("WiFi started");
-
-    wifi.connect()?;
-    log::info!("WiFi connected");
-
-    wifi.wait_netif_up()?;
-    let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-    log::info!("WiFi DHCP info: {:?}", ip_info);
+    // LED setup (first so we get visual feedback immediately)
+    let mut ws2812 = Ws2812Esp32Rmt::new(peripherals.rmt.channel0, peripherals.pins.gpio8)?;
+    log::info!("RGB LED ready!");
 
     // OLED display setup (SSD1306 128x64 I2C on GPIO6/GPIO7)
     let i2c_config = I2cConfig::new().baudrate(400_000.into());
@@ -73,8 +55,44 @@ fn main() -> anyhow::Result<()> {
         .draw(&mut display)
         .map_err(|e| anyhow::anyhow!("Draw: {:?}", e))?;
 
-    let ip_str = format!("IP: {}", ip_info.ip);
-    Text::new(&ip_str, Point::new(0, 24), text_style)
+    // WiFi setup (non-fatal — display and LED work regardless)
+    let sysloop = EspSystemEventLoop::take()?;
+    let nvs = EspDefaultNvsPartition::take()?;
+    let mut wifi = BlockingWifi::wrap(
+        EspWifi::new(peripherals.modem, sysloop.clone(), Some(nvs))?,
+        sysloop,
+    )?;
+
+    let wifi_ip = (|| -> anyhow::Result<String> {
+        wifi.set_configuration(&Configuration::Client(ClientConfiguration {
+            ssid: WIFI_SSID.try_into().map_err(|_| anyhow::anyhow!("SSID too long"))?,
+            password: WIFI_PASS.try_into().map_err(|_| anyhow::anyhow!("Password too long"))?,
+            auth_method: AuthMethod::WPA2Personal,
+            ..Default::default()
+        }))?;
+
+        wifi.start()?;
+        log::info!("WiFi started");
+
+        wifi.connect()?;
+        log::info!("WiFi connected");
+
+        wifi.wait_netif_up()?;
+        let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
+        log::info!("WiFi DHCP info: {:?}", ip_info);
+
+        Ok(format!("IP: {}", ip_info.ip))
+    })();
+
+    let status_line = match &wifi_ip {
+        Ok(ip) => ip.as_str(),
+        Err(e) => {
+            log::error!("WiFi failed: {}", e);
+            "WiFi: offline"
+        }
+    };
+
+    Text::new(status_line, Point::new(0, 24), text_style)
         .draw(&mut display)
         .map_err(|e| anyhow::anyhow!("Draw: {:?}", e))?;
 
@@ -82,11 +100,6 @@ fn main() -> anyhow::Result<()> {
         .flush()
         .map_err(|e| anyhow::anyhow!("Flush: {:?}", e))?;
     log::info!("OLED display initialized!");
-
-    // LED setup
-    let mut ws2812 = Ws2812Esp32Rmt::new(peripherals.rmt.channel0, peripherals.pins.gpio8)?;
-
-    log::info!("RGB LED ready!");
 
     let mut hue: u8 = 0;
     loop {
