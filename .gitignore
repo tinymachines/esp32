@@ -1,3 +1,5 @@
 target/
 .embuild/
 *.tar.gz
+camera/snapshot.jpg
+camera/snapshots/
