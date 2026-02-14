@@ -1,0 +1,9 @@
+[package]
+name = "game-of-life"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "life"
+path = "src/main.rs"
+
