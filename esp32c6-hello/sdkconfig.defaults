@@ -1,8 +1,12 @@
-# Rust + WiFi requires more stack than default
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+# Reduced stack — no WiFi needed
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # Enable logging output over serial
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
 # Use 160 MHz CPU clock (max for ESP32-C6)
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+
+# Disable WiFi and BT to save flash
+CONFIG_ESP_WIFI_ENABLED=n
+CONFIG_BT_ENABLED=n
