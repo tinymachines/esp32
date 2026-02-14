@@ -1,3 +1,4 @@
+use esp_idf_svc::hal::gpio::PinDriver;
 use esp_idf_svc::hal::i2c::{I2cConfig, I2cDriver};
 use esp_idf_svc::hal::peripherals::Peripherals;
 use smart_leds::hsv::{hsv2rgb, Hsv};
@@ -17,7 +18,6 @@ struct Rng(u32);
 impl Rng {
     fn from_timer() -> Self {
         let seed = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u32;
-        // Ensure non-zero seed
         Self(seed | 1)
     }
 
@@ -56,6 +56,11 @@ impl Grid {
     fn clear(&mut self) {
         self.cells.fill(0);
     }
+
+    /// Count total live cells using popcount.
+    fn population(&self) -> u32 {
+        self.cells.iter().map(|b| b.count_ones()).sum()
+    }
 }
 
 /// Count live neighbors with toroidal wrapping.
@@ -84,7 +89,6 @@ fn step(current: &Grid, next: &mut Grid) {
         for x in 0..WIDTH {
             let neighbors = count_neighbors(current, x, y);
             let alive = current.get(x, y);
-            // B3/S23: born if 3 neighbors, survive if 2 or 3
             if neighbors == 3 || (alive && neighbors == 2) {
                 next.set(x, y);
             }
@@ -116,7 +120,44 @@ fn scatter_random(grid: &mut Grid, rng: &mut Rng, density: u8) {
     }
 }
 
-// ─── Patterns ported from docs/life/lib.rs ───────────────────────
+/// Map population to LED color reflecting colony health.
+/// Red = dying/empty, green = thriving, blue/cyan = overcrowded.
+/// Brightness pulses with rate of change.
+fn health_color(pop: u32, prev_pop: u32) -> Hsv {
+    // Map population to hue: 0 (red) → 80 (green) → 140 (cyan)
+    // Sweet spot ~300-800 cells = green
+    let hue = if pop < 50 {
+        0 // red — nearly dead
+    } else if pop < 300 {
+        // red → green as population grows
+        ((pop - 50) * 80 / 250) as u8
+    } else if pop < 800 {
+        80 // green — thriving
+    } else if pop < 1500 {
+        // green → cyan as population gets dense
+        (80 + (pop - 800) * 60 / 700) as u8
+    } else {
+        140 // cyan/blue — overcrowded
+    };
+
+    // Brightness based on rate of change — big changes = bright flash
+    let delta = (pop as i32 - prev_pop as i32).unsigned_abs();
+    let val = if delta > 100 {
+        40 // bright flash — explosion or mass die-off
+    } else if delta > 30 {
+        20
+    } else {
+        8 // calm
+    };
+
+    Hsv {
+        hue,
+        sat: 255,
+        val,
+    }
+}
+
+// ─── Patterns ────────────────────────────────────────────────────
 
 const GLIDER: &str = "\
 .O.
@@ -160,57 +201,49 @@ O....O.O....O
 .............
 ..OOO...OOO..";
 
-/// Each scene defines a name and a function to populate a grid.
 struct Scene {
     name: &'static str,
     load: fn(&mut Grid, &mut Rng),
 }
 
 const SCENES: &[Scene] = &[
-    // R-pentomino in the center — chaotic expansion
     Scene {
         name: "R-pentomino + soup",
         load: |grid, rng| {
             grid.clear();
             stamp_pattern(grid, R_PENTOMINO, 62, 30);
-            scatter_random(grid, rng, 8); // ~3% fill
+            scatter_random(grid, rng, 8);
         },
     },
-    // Gosper gun firing into random debris
     Scene {
         name: "Gosper Gun + chaos",
         load: |grid, rng| {
             grid.clear();
             stamp_pattern(grid, GOSPER_GUN, 2, 2);
-            stamp_pattern(grid, GOSPER_GUN, 90, 50); // second gun, opposite corner
-            scatter_random(grid, rng, 10); // ~4% fill
+            stamp_pattern(grid, GOSPER_GUN, 90, 50);
+            scatter_random(grid, rng, 10);
         },
     },
-    // Pure random soup — maximum chaos
     Scene {
         name: "Random soup",
         load: |grid, rng| {
             grid.clear();
-            scatter_random(grid, rng, 45); // ~18% fill — sweet spot for chaos
+            scatter_random(grid, rng, 45);
         },
     },
-    // Fleet of spaceships in a random field
     Scene {
         name: "Armada",
         load: |grid, rng| {
             grid.clear();
-            // Diagonal gliders
             for i in 0..6 {
                 stamp_pattern(grid, GLIDER, i * 20, i * 10);
             }
-            // Horizontal spaceships
             stamp_pattern(grid, LWSS, 4, 15);
             stamp_pattern(grid, LWSS, 4, 45);
             stamp_pattern(grid, LWSS, 60, 30);
-            scatter_random(grid, rng, 5); // light debris
+            scatter_random(grid, rng, 5);
         },
     },
-    // Pulsars tiling the screen
     Scene {
         name: "Pulsar garden",
         load: |grid, rng| {
@@ -221,10 +254,9 @@ const SCENES: &[Scene] = &[
             stamp_pattern(grid, PULSAR, 5, 40);
             stamp_pattern(grid, PULSAR, 55, 40);
             stamp_pattern(grid, PULSAR, 105, 40);
-            scatter_random(grid, rng, 3); // tiny bit of noise to perturb
+            scatter_random(grid, rng, 3);
         },
     },
-    // Multiple R-pentominoes colliding
     Scene {
         name: "R-pentomino collider",
         load: |grid, rng| {
@@ -237,12 +269,11 @@ const SCENES: &[Scene] = &[
             scatter_random(grid, rng, 6);
         },
     },
-    // Dense random soup — wild
     Scene {
         name: "Primordial soup",
         load: |grid, rng| {
             grid.clear();
-            scatter_random(grid, rng, 64); // ~25% fill
+            scatter_random(grid, rng, 64);
         },
     },
 ];
@@ -256,6 +287,10 @@ fn main() -> anyhow::Result<()> {
     // LED setup
     let mut ws2812 = Ws2812Esp32Rmt::new(peripherals.rmt.channel0, peripherals.pins.gpio8)?;
     log::info!("RGB LED ready");
+
+    // BOOT button on GPIO9 — active low, internal pull-up
+    let button = PinDriver::input(peripherals.pins.gpio9)?;
+    log::info!("Button ready (GPIO9 BOOT)");
 
     // OLED display setup (SSD1306 128x64 I2C on GPIO6/GPIO7)
     let i2c_config = I2cConfig::new().baudrate(400_000.into());
@@ -287,7 +322,8 @@ fn main() -> anyhow::Result<()> {
 
     let mut scene_idx: usize = 0;
     let mut generation: u32 = 0;
-    let mut hue: u8 = 0;
+    let mut prev_pop: u32 = 0;
+    let mut button_was_pressed = false;
 
     // Load initial scene
     let scene = &SCENES[scene_idx];
@@ -297,7 +333,7 @@ fn main() -> anyhow::Result<()> {
     loop {
         let current = if use_a { &grid_a } else { &grid_b };
 
-        // Render: set pixels for live cells
+        // Render
         display.clear_buffer();
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
@@ -310,7 +346,13 @@ fn main() -> anyhow::Result<()> {
             .flush()
             .map_err(|e| anyhow::anyhow!("Flush: {:?}", e))?;
 
-        // Step: compute next generation
+        // Population + health LED
+        let pop = current.population();
+        let color = hsv2rgb(health_color(pop, prev_pop));
+        ws2812.write([color].iter().copied())?;
+        prev_pop = pop;
+
+        // Step
         if use_a {
             step(&grid_a, &mut grid_b);
         } else {
@@ -319,17 +361,21 @@ fn main() -> anyhow::Result<()> {
         use_a = !use_a;
         generation += 1;
 
-        // LED heartbeat: slow hue cycle
-        let color = hsv2rgb(Hsv {
-            hue,
-            sat: 255,
-            val: 8,
-        });
-        ws2812.write([color].iter().copied())?;
-        hue = hue.wrapping_add(1);
+        // Button: reroll current scene (edge-triggered, debounced)
+        let pressed = button.is_low();
+        if pressed && !button_was_pressed {
+            // Re-seed the RNG from timer for fresh randomness
+            rng = Rng::from_timer();
+            let scene = &SCENES[scene_idx];
+            let grid = if use_a { &mut grid_a } else { &mut grid_b };
+            (scene.load)(grid, &mut rng);
+            generation = 0;
+            log::info!("Reroll: {} (button)", scene.name);
+        }
+        button_was_pressed = pressed;
 
-        // Cycle scene every 200 generations
-        if generation % 200 == 0 {
+        // Auto-cycle scene every 200 generations
+        if generation % 200 == 0 && generation > 0 {
             scene_idx = (scene_idx + 1) % SCENES.len();
             let scene = &SCENES[scene_idx];
             let grid = if use_a { &mut grid_a } else { &mut grid_b };
