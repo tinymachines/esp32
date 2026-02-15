@@ -8,9 +8,11 @@ use std::thread;
 use std::time::Duration;
 use ws2812_esp32_rmt_driver::Ws2812Esp32Rmt;
 
-const WIDTH: usize = 128;
-const HEIGHT: usize = 64;
-const GRID_BYTES: usize = WIDTH * HEIGHT / 8; // 1024
+const WORLD_W: usize = 512;
+const WORLD_H: usize = 256;
+const SCREEN_W: usize = 128;
+const SCREEN_H: usize = 64;
+const GRID_BYTES: usize = WORLD_W * WORLD_H / 8; // 16,384
 
 /// Simple xorshift32 PRNG seeded from hardware timer.
 struct Rng(u32);
@@ -29,7 +31,7 @@ impl Rng {
     }
 }
 
-/// Bitfield grid: 128x64, row-major, 1 bit per cell.
+/// Bitfield grid: WORLD_W x WORLD_H, row-major, 1 bit per cell.
 struct Grid {
     cells: [u8; GRID_BYTES],
 }
@@ -43,13 +45,13 @@ impl Grid {
 
     #[inline]
     fn get(&self, x: usize, y: usize) -> bool {
-        let idx = y * WIDTH + x;
+        let idx = y * WORLD_W + x;
         self.cells[idx / 8] & (1 << (idx % 8)) != 0
     }
 
     #[inline]
     fn set(&mut self, x: usize, y: usize) {
-        let idx = y * WIDTH + x;
+        let idx = y * WORLD_W + x;
         self.cells[idx / 8] |= 1 << (idx % 8);
     }
 
@@ -67,13 +69,13 @@ impl Grid {
 #[inline]
 fn count_neighbors(grid: &Grid, x: usize, y: usize) -> u8 {
     let mut count = 0u8;
-    for dy in [HEIGHT - 1, 0, 1] {
-        for dx in [WIDTH - 1, 0, 1] {
+    for dy in [WORLD_H - 1, 0, 1] {
+        for dx in [WORLD_W - 1, 0, 1] {
             if dx == 0 && dy == 0 {
                 continue;
             }
-            let nx = (x + dx) % WIDTH;
-            let ny = (y + dy) % HEIGHT;
+            let nx = (x + dx) % WORLD_W;
+            let ny = (y + dy) % WORLD_H;
             if grid.get(nx, ny) {
                 count += 1;
             }
@@ -85,8 +87,8 @@ fn count_neighbors(grid: &Grid, x: usize, y: usize) -> u8 {
 /// Advance one generation: read from `current`, write into `next`.
 fn step(current: &Grid, next: &mut Grid) {
     next.clear();
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
+    for y in 0..WORLD_H {
+        for x in 0..WORLD_W {
             let neighbors = count_neighbors(current, x, y);
             let alive = current.get(x, y);
             if neighbors == 3 || (alive && neighbors == 2) {
@@ -101,8 +103,8 @@ fn stamp_pattern(grid: &mut Grid, pattern: &str, offset_x: usize, offset_y: usiz
     for (row, line) in pattern.lines().enumerate() {
         for (col, ch) in line.chars().enumerate() {
             if ch == 'O' {
-                let x = (offset_x + col) % WIDTH;
-                let y = (offset_y + row) % HEIGHT;
+                let x = (offset_x + col) % WORLD_W;
+                let y = (offset_y + row) % WORLD_H;
                 grid.set(x, y);
             }
         }
@@ -111,8 +113,8 @@ fn stamp_pattern(grid: &mut Grid, pattern: &str, offset_x: usize, offset_y: usiz
 
 /// Scatter random live cells across the grid (~density/256 fill rate).
 fn scatter_random(grid: &mut Grid, rng: &mut Rng, density: u8) {
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
+    for y in 0..WORLD_H {
+        for x in 0..WORLD_W {
             if (rng.next() & 0xFF) < density as u32 {
                 grid.set(x, y);
             }
@@ -123,28 +125,29 @@ fn scatter_random(grid: &mut Grid, rng: &mut Rng, density: u8) {
 /// Map population to LED color reflecting colony health.
 /// Red = dying/empty, green = thriving, blue/cyan = overcrowded.
 /// Brightness pulses with rate of change.
+/// Thresholds scaled for 512x256 world (~131K cells).
 fn health_color(pop: u32, prev_pop: u32) -> Hsv {
     // Map population to hue: 0 (red) → 80 (green) → 140 (cyan)
-    // Sweet spot ~300-800 cells = green
-    let hue = if pop < 50 {
+    // Sweet spot ~5000-12000 cells = green (16x the old 128x64 thresholds)
+    let hue = if pop < 800 {
         0 // red — nearly dead
-    } else if pop < 300 {
+    } else if pop < 5000 {
         // red → green as population grows
-        ((pop - 50) * 80 / 250) as u8
-    } else if pop < 800 {
+        ((pop - 800) * 80 / 4200) as u8
+    } else if pop < 12000 {
         80 // green — thriving
-    } else if pop < 1500 {
+    } else if pop < 24000 {
         // green → cyan as population gets dense
-        (80 + (pop - 800) * 60 / 700) as u8
+        (80 + (pop - 12000) * 60 / 12000) as u8
     } else {
         140 // cyan/blue — overcrowded
     };
 
     // Brightness based on rate of change — big changes = bright flash
     let delta = (pop as i32 - prev_pop as i32).unsigned_abs();
-    let val = if delta > 100 {
+    let val = if delta > 1600 {
         40 // bright flash — explosion or mass die-off
-    } else if delta > 30 {
+    } else if delta > 500 {
         20
     } else {
         8 // calm
@@ -154,6 +157,71 @@ fn health_color(pop: u32, prev_pop: u32) -> Hsv {
         hue,
         sat: 255,
         val,
+    }
+}
+
+// ─── Viewport ────────────────────────────────────────────────────
+
+struct Viewport {
+    x: i32,
+    y: i32,
+    tx: i32,
+    ty: i32,
+    linger: u32,
+}
+
+impl Viewport {
+    fn new() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            tx: 0,
+            ty: 0,
+            linger: 0,
+        }
+    }
+
+    /// Pick a new random target and linger duration.
+    fn pick_target(&mut self, rng: &mut Rng) {
+        self.tx = (rng.next() % WORLD_W as u32) as i32;
+        self.ty = (rng.next() % WORLD_H as u32) as i32;
+        self.linger = 60 + (rng.next() % 61); // 60–120 generations
+    }
+
+    /// Move one pixel toward target each axis, wrapping toroidally.
+    fn update(&mut self, rng: &mut Rng) {
+        if self.linger > 0 {
+            self.linger -= 1;
+            if self.linger == 0 {
+                self.pick_target(rng);
+            }
+            return;
+        }
+
+        // Shortest-path movement on torus for x
+        let dx = ((self.tx - self.x).rem_euclid(WORLD_W as i32) + WORLD_W as i32 / 2)
+            % WORLD_W as i32
+            - WORLD_W as i32 / 2;
+        if dx > 0 {
+            self.x = (self.x + 1).rem_euclid(WORLD_W as i32);
+        } else if dx < 0 {
+            self.x = (self.x - 1).rem_euclid(WORLD_W as i32);
+        }
+
+        // Shortest-path movement on torus for y
+        let dy = ((self.ty - self.y).rem_euclid(WORLD_H as i32) + WORLD_H as i32 / 2)
+            % WORLD_H as i32
+            - WORLD_H as i32 / 2;
+        if dy > 0 {
+            self.y = (self.y + 1).rem_euclid(WORLD_H as i32);
+        } else if dy < 0 {
+            self.y = (self.y - 1).rem_euclid(WORLD_H as i32);
+        }
+
+        // Arrived at target — start lingering
+        if dx == 0 && dy == 0 {
+            self.linger = 60 + (rng.next() % 61);
+        }
     }
 }
 
@@ -211,7 +279,12 @@ const SCENES: &[Scene] = &[
         name: "R-pentomino + soup",
         load: |grid, rng| {
             grid.clear();
-            stamp_pattern(grid, R_PENTOMINO, 62, 30);
+            // Scatter R-pentominoes across the world
+            for _ in 0..8 {
+                let x = (rng.next() % WORLD_W as u32) as usize;
+                let y = (rng.next() % WORLD_H as u32) as usize;
+                stamp_pattern(grid, R_PENTOMINO, x, y);
+            }
             scatter_random(grid, rng, 8);
         },
     },
@@ -219,8 +292,13 @@ const SCENES: &[Scene] = &[
         name: "Gosper Gun + chaos",
         load: |grid, rng| {
             grid.clear();
-            stamp_pattern(grid, GOSPER_GUN, 2, 2);
-            stamp_pattern(grid, GOSPER_GUN, 90, 50);
+            // Place guns in each quadrant
+            stamp_pattern(grid, GOSPER_GUN, 20, 20);
+            stamp_pattern(grid, GOSPER_GUN, 280, 20);
+            stamp_pattern(grid, GOSPER_GUN, 20, 140);
+            stamp_pattern(grid, GOSPER_GUN, 280, 140);
+            stamp_pattern(grid, GOSPER_GUN, 150, 80);
+            stamp_pattern(grid, GOSPER_GUN, 400, 200);
             scatter_random(grid, rng, 10);
         },
     },
@@ -235,12 +313,16 @@ const SCENES: &[Scene] = &[
         name: "Armada",
         load: |grid, rng| {
             grid.clear();
-            for i in 0..6 {
-                stamp_pattern(grid, GLIDER, i * 20, i * 10);
+            for _ in 0..16 {
+                let x = (rng.next() % WORLD_W as u32) as usize;
+                let y = (rng.next() % WORLD_H as u32) as usize;
+                stamp_pattern(grid, GLIDER, x, y);
             }
-            stamp_pattern(grid, LWSS, 4, 15);
-            stamp_pattern(grid, LWSS, 4, 45);
-            stamp_pattern(grid, LWSS, 60, 30);
+            for _ in 0..8 {
+                let x = (rng.next() % WORLD_W as u32) as usize;
+                let y = (rng.next() % WORLD_H as u32) as usize;
+                stamp_pattern(grid, LWSS, x, y);
+            }
             scatter_random(grid, rng, 5);
         },
     },
@@ -248,12 +330,17 @@ const SCENES: &[Scene] = &[
         name: "Pulsar garden",
         load: |grid, rng| {
             grid.clear();
-            stamp_pattern(grid, PULSAR, 5, 5);
-            stamp_pattern(grid, PULSAR, 55, 5);
-            stamp_pattern(grid, PULSAR, 105, 5);
-            stamp_pattern(grid, PULSAR, 5, 40);
-            stamp_pattern(grid, PULSAR, 55, 40);
-            stamp_pattern(grid, PULSAR, 105, 40);
+            // Grid of pulsars spread across the world
+            for row in 0..4 {
+                for col in 0..8 {
+                    stamp_pattern(
+                        grid,
+                        PULSAR,
+                        col * 60 + 10,
+                        row * 60 + 10,
+                    );
+                }
+            }
             scatter_random(grid, rng, 3);
         },
     },
@@ -261,11 +348,11 @@ const SCENES: &[Scene] = &[
         name: "R-pentomino collider",
         load: |grid, rng| {
             grid.clear();
-            stamp_pattern(grid, R_PENTOMINO, 20, 15);
-            stamp_pattern(grid, R_PENTOMINO, 60, 30);
-            stamp_pattern(grid, R_PENTOMINO, 100, 15);
-            stamp_pattern(grid, R_PENTOMINO, 40, 50);
-            stamp_pattern(grid, R_PENTOMINO, 80, 50);
+            for _ in 0..12 {
+                let x = (rng.next() % WORLD_W as u32) as usize;
+                let y = (rng.next() % WORLD_H as u32) as usize;
+                stamp_pattern(grid, R_PENTOMINO, x, y);
+            }
             scatter_random(grid, rng, 6);
         },
     },
@@ -315,9 +402,9 @@ fn main() -> anyhow::Result<()> {
 
     let mut rng = Rng::from_timer();
 
-    // Game of Life state — double buffered
-    let mut grid_a = Grid::new();
-    let mut grid_b = Grid::new();
+    // Game of Life state — double buffered (heap-allocated for 32 KB each)
+    let mut grid_a = Box::new(Grid::new());
+    let mut grid_b = Box::new(Grid::new());
     let mut use_a = true;
 
     let mut scene_idx: usize = 0;
@@ -325,20 +412,25 @@ fn main() -> anyhow::Result<()> {
     let mut prev_pop: u32 = 0;
     let mut button_was_pressed = false;
 
+    let mut vp = Viewport::new();
+    vp.pick_target(&mut rng);
+
     // Load initial scene
     let scene = &SCENES[scene_idx];
     (scene.load)(&mut grid_a, &mut rng);
     log::info!("Scene: {} (gen 0)", scene.name);
 
     loop {
-        let current = if use_a { &grid_a } else { &grid_b };
+        let current = if use_a { &*grid_a } else { &*grid_b };
 
-        // Render
+        // Render viewport region
         display.clear_buffer();
-        for y in 0..HEIGHT {
-            for x in 0..WIDTH {
-                if current.get(x, y) {
-                    let _ = display.set_pixel(x as u32, y as u32, true);
+        for sy in 0..SCREEN_H {
+            for sx in 0..SCREEN_W {
+                let wx = (vp.x as usize + sx) % WORLD_W;
+                let wy = (vp.y as usize + sy) % WORLD_H;
+                if current.get(wx, wy) {
+                    let _ = display.set_pixel(sx as u32, sy as u32, true);
                 }
             }
         }
@@ -361,15 +453,19 @@ fn main() -> anyhow::Result<()> {
         use_a = !use_a;
         generation += 1;
 
+        // Pan viewport
+        vp.update(&mut rng);
+
         // Button: reroll current scene (edge-triggered, debounced)
         let pressed = button.is_low();
         if pressed && !button_was_pressed {
-            // Re-seed the RNG from timer for fresh randomness
             rng = Rng::from_timer();
             let scene = &SCENES[scene_idx];
-            let grid = if use_a { &mut grid_a } else { &mut grid_b };
+            let grid = if use_a { &mut *grid_a } else { &mut *grid_b };
             (scene.load)(grid, &mut rng);
             generation = 0;
+            vp = Viewport::new();
+            vp.pick_target(&mut rng);
             log::info!("Reroll: {} (button)", scene.name);
         }
         button_was_pressed = pressed;
@@ -378,8 +474,10 @@ fn main() -> anyhow::Result<()> {
         if generation % 200 == 0 && generation > 0 {
             scene_idx = (scene_idx + 1) % SCENES.len();
             let scene = &SCENES[scene_idx];
-            let grid = if use_a { &mut grid_a } else { &mut grid_b };
+            let grid = if use_a { &mut *grid_a } else { &mut *grid_b };
             (scene.load)(grid, &mut rng);
+            vp = Viewport::new();
+            vp.pick_target(&mut rng);
             log::info!("Scene: {} (gen {})", scene.name, generation);
         }
 
