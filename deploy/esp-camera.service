@@ -1,0 +1,19 @@
+[Unit]
+Description=ESP Camera Calibration Web App
+After=network.target
+
+[Service]
+Type=simple
+User=bisenbek
+Group=bisenbek
+SupplementaryGroups=video
+WorkingDirectory=/home/bisenbek/projects/esp/camera
+Environment="PATH=/home/bisenbek/.pyenv/versions/esp/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/bisenbek/.pyenv/versions/esp/bin/python app.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/bisenbek/projects/esp/camera/logs/app.log
+StandardError=append:/home/bisenbek/projects/esp/camera/logs/app.log
+
+[Install]
+WantedBy=multi-user.target

@@ -13,6 +13,10 @@ const WORLD_H: usize = 256;
 const SCREEN_W: usize = 128;
 const SCREEN_H: usize = 64;
 const GRID_BYTES: usize = WORLD_W * WORLD_H / 8; // 16,384
+const TILE_W: usize = 64;
+const TILE_H: usize = 64;
+const TILES_X: usize = WORLD_W / TILE_W; // 8
+const TILES_Y: usize = WORLD_H / TILE_H; // 4
 
 /// Simple xorshift32 PRNG seeded from hardware timer.
 struct Rng(u32);
@@ -62,6 +66,20 @@ impl Grid {
     /// Count total live cells using popcount.
     fn population(&self) -> u32 {
         self.cells.iter().map(|b| b.count_ones()).sum()
+    }
+
+    /// Count population in a tile (TILE_W x TILE_H block).
+    fn tile_population(&self, tx: usize, ty: usize) -> u32 {
+        let mut count = 0u32;
+        let x0_byte = tx * (TILE_W / 8);
+        let row_bytes = WORLD_W / 8;
+        for row in 0..TILE_H {
+            let base = (ty * TILE_H + row) * row_bytes + x0_byte;
+            for b in 0..(TILE_W / 8) {
+                count += self.cells[base + b].count_ones();
+            }
+        }
+        count
     }
 }
 
@@ -188,12 +206,54 @@ impl Viewport {
         self.linger = 60 + (rng.next() % 61); // 60–120 generations
     }
 
+    /// Pick target biased toward regions with live cells.
+    /// Scans 8x4 tiles, picks one weighted by population.
+    fn pick_target_seeking(&mut self, grid: &Grid, rng: &mut Rng) {
+        // Compute population per tile
+        let mut pops = [0u32; TILES_X * TILES_Y];
+        let mut total = 0u32;
+        for ty in 0..TILES_Y {
+            for tx in 0..TILES_X {
+                let p = grid.tile_population(tx, ty);
+                pops[ty * TILES_X + tx] = p;
+                total += p;
+            }
+        }
+
+        if total == 0 {
+            // World is empty, pick random
+            self.pick_target(rng);
+            return;
+        }
+
+        // Weighted random selection
+        let mut threshold = rng.next() % total;
+        let mut chosen_tx = 0;
+        let mut chosen_ty = 0;
+        'outer: for ty in 0..TILES_Y {
+            for tx in 0..TILES_X {
+                let p = pops[ty * TILES_X + tx];
+                if threshold < p {
+                    chosen_tx = tx;
+                    chosen_ty = ty;
+                    break 'outer;
+                }
+                threshold -= p;
+            }
+        }
+
+        // Target center of chosen tile + random jitter within tile
+        self.tx = (chosen_tx * TILE_W + (rng.next() as usize % TILE_W)) as i32;
+        self.ty = (chosen_ty * TILE_H + (rng.next() as usize % TILE_H)) as i32;
+        self.linger = 60 + (rng.next() % 61);
+    }
+
     /// Move one pixel toward target each axis, wrapping toroidally.
-    fn update(&mut self, rng: &mut Rng) {
+    fn update(&mut self, grid: &Grid, rng: &mut Rng) {
         if self.linger > 0 {
             self.linger -= 1;
             if self.linger == 0 {
-                self.pick_target(rng);
+                self.pick_target_seeking(grid, rng);
             }
             return;
         }
@@ -280,12 +340,12 @@ const SCENES: &[Scene] = &[
         load: |grid, rng| {
             grid.clear();
             // Scatter R-pentominoes across the world
-            for _ in 0..8 {
+            for _ in 0..16 {
                 let x = (rng.next() % WORLD_W as u32) as usize;
                 let y = (rng.next() % WORLD_H as u32) as usize;
                 stamp_pattern(grid, R_PENTOMINO, x, y);
             }
-            scatter_random(grid, rng, 8);
+            scatter_random(grid, rng, 20);
         },
     },
     Scene {
@@ -299,31 +359,31 @@ const SCENES: &[Scene] = &[
             stamp_pattern(grid, GOSPER_GUN, 280, 140);
             stamp_pattern(grid, GOSPER_GUN, 150, 80);
             stamp_pattern(grid, GOSPER_GUN, 400, 200);
-            scatter_random(grid, rng, 10);
+            scatter_random(grid, rng, 25);
         },
     },
     Scene {
         name: "Random soup",
         load: |grid, rng| {
             grid.clear();
-            scatter_random(grid, rng, 45);
+            scatter_random(grid, rng, 70);
         },
     },
     Scene {
         name: "Armada",
         load: |grid, rng| {
             grid.clear();
-            for _ in 0..16 {
+            for _ in 0..32 {
                 let x = (rng.next() % WORLD_W as u32) as usize;
                 let y = (rng.next() % WORLD_H as u32) as usize;
                 stamp_pattern(grid, GLIDER, x, y);
             }
-            for _ in 0..8 {
+            for _ in 0..16 {
                 let x = (rng.next() % WORLD_W as u32) as usize;
                 let y = (rng.next() % WORLD_H as u32) as usize;
                 stamp_pattern(grid, LWSS, x, y);
             }
-            scatter_random(grid, rng, 5);
+            scatter_random(grid, rng, 15);
         },
     },
     Scene {
@@ -341,26 +401,26 @@ const SCENES: &[Scene] = &[
                     );
                 }
             }
-            scatter_random(grid, rng, 3);
+            scatter_random(grid, rng, 12);
         },
     },
     Scene {
         name: "R-pentomino collider",
         load: |grid, rng| {
             grid.clear();
-            for _ in 0..12 {
+            for _ in 0..20 {
                 let x = (rng.next() % WORLD_W as u32) as usize;
                 let y = (rng.next() % WORLD_H as u32) as usize;
                 stamp_pattern(grid, R_PENTOMINO, x, y);
             }
-            scatter_random(grid, rng, 6);
+            scatter_random(grid, rng, 18);
         },
     },
     Scene {
         name: "Primordial soup",
         load: |grid, rng| {
             grid.clear();
-            scatter_random(grid, rng, 64);
+            scatter_random(grid, rng, 90);
         },
     },
 ];
@@ -413,11 +473,11 @@ fn main() -> anyhow::Result<()> {
     let mut button_was_pressed = false;
 
     let mut vp = Viewport::new();
-    vp.pick_target(&mut rng);
 
     // Load initial scene
     let scene = &SCENES[scene_idx];
     (scene.load)(&mut grid_a, &mut rng);
+    vp.pick_target_seeking(&grid_a, &mut rng);
     log::info!("Scene: {} (gen 0)", scene.name);
 
     loop {
@@ -454,7 +514,8 @@ fn main() -> anyhow::Result<()> {
         generation += 1;
 
         // Pan viewport
-        vp.update(&mut rng);
+        let current_ref = if use_a { &*grid_a } else { &*grid_b };
+        vp.update(current_ref, &mut rng);
 
         // Button: reroll current scene (edge-triggered, debounced)
         let pressed = button.is_low();
@@ -465,7 +526,7 @@ fn main() -> anyhow::Result<()> {
             (scene.load)(grid, &mut rng);
             generation = 0;
             vp = Viewport::new();
-            vp.pick_target(&mut rng);
+            vp.pick_target_seeking(grid, &mut rng);
             log::info!("Reroll: {} (button)", scene.name);
         }
         button_was_pressed = pressed;
@@ -477,7 +538,7 @@ fn main() -> anyhow::Result<()> {
             let grid = if use_a { &mut *grid_a } else { &mut *grid_b };
             (scene.load)(grid, &mut rng);
             vp = Viewport::new();
-            vp.pick_target(&mut rng);
+            vp.pick_target_seeking(grid, &mut rng);
             log::info!("Scene: {} (gen {})", scene.name, generation);
         }
 

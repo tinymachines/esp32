@@ -1,5 +1,17 @@
 target/
 .embuild/
 *.tar.gz
+
+# Python
+__pycache__/
+
+# Camera artifacts
 camera/snapshot.jpg
 camera/snapshots/
+camera/snapshot_*.jpg
+camera/logs/
+camera/monitor/
+camera/.sesskey
+
+# tinygrad source checkout
+tinygrad/
