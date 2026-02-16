@@ -448,13 +448,24 @@ def _slider_js(values: dict[str, int]) -> str:
     return "".join(parts)
 
 def _capture_frame() -> np.ndarray:
-    """Capture a fresh frame from the shared camera (discards buffer)."""
+    """Capture a fresh frame from the shared camera (discards 2 buffered frames)."""
     with cam.lock:
+        cam.cap.read()
         cam.cap.read()
         ok, frame = cam.cap.read()
     if not ok:
         raise RuntimeError("Capture failed")
     return frame
+
+def _score_position(bbox, n=3) -> float:
+    """Score current focus by taking median Laplacian over n frames."""
+    scores = []
+    for _ in range(n):
+        frame = _capture_frame()
+        scores.append(_laplacian_score(frame, bbox))
+        time.sleep(0.05)
+    scores.sort()
+    return scores[len(scores) // 2]
 
 def _find_oled_rect(frame: np.ndarray):
     """Detect OLED via blue HSV threshold. Returns (x,y,w,h) or None."""
@@ -487,7 +498,7 @@ def _laplacian_score(frame: np.ndarray, bbox) -> float:
     """Laplacian variance sharpness score, normalized to [0, 1]."""
     x, y, w, h = bbox
     gray = cv2.cvtColor(frame[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
-    return min(cv2.Laplacian(gray, cv2.CV_64F).var() / 500.0, 1.0)
+    return min(cv2.Laplacian(gray, cv2.CV_64F).var() / 2000.0, 1.0)
 
 def _af_panel_current():
     """Return the appropriate af-panel for current state."""
@@ -519,16 +530,19 @@ def _run_autofocus():
         _af_log.append((msg, cls))
 
     try:
-        time.sleep(0.3)
-        # Restore position to OLED closeup so it's in frame
-        log("Restoring zoom/pan/tilt to OLED preset...")
-        for name, val in [("zoom_absolute", 150), ("pan_absolute", 0), ("tilt_absolute", 0)]:
+        time.sleep(0.5)
+        # Restore everything except focus — leave focus as the variable
+        log("Restoring camera preset (keeping random focus)...")
+        restore = {
+            "zoom_absolute": 150, "pan_absolute": 0, "tilt_absolute": 0,
+            "focus_automatic_continuous": 0, "sharpness": 180,
+            "brightness": 128, "contrast": 128, "saturation": 128,
+            "gain": 0, "backlight_compensation": 1,
+            "auto_exposure": 3, "white_balance_automatic": 1,
+        }
+        for name, val in restore.items():
             cam.set_ctrl(name, val)
-        time.sleep(1.0)  # extra settle for zoom motor
-
-        log("Disabling hardware autofocus...")
-        cam.set_ctrl("focus_automatic_continuous", 0)
-        time.sleep(0.2)
+        time.sleep(1.2)  # settle for zoom motor + image pipeline
 
         log("Detecting OLED region at focus=30...")
         cam.set_ctrl("focus_absolute", 30)
@@ -542,16 +556,15 @@ def _run_autofocus():
             log("  OLED not detected, using center crop", "af-warn")
             bbox = _center_crop_rect(frame)
 
-        # Coarse sweep
+        # Coarse sweep — every 10 steps, 3-frame median at each
         log("")
-        log("--- Coarse sweep ---", "af-header")
-        coarse = [0, 10, 20, 30, 45, 60, 80]
+        log("--- Coarse sweep (3-frame median) ---", "af-header")
+        coarse = list(range(0, 90, 10))  # [0, 10, 20, 30, 40, 50, 60, 70, 80]
         results = []
         for pos in coarse:
             cam.set_ctrl("focus_absolute", pos)
-            time.sleep(0.3)
-            frame = _capture_frame()
-            score = _laplacian_score(frame, bbox)
+            time.sleep(0.4)
+            score = _score_position(bbox, n=3)
             results.append((pos, score))
             bar = chr(9608) * int(score * 30)
             log(f"  focus={pos:3d}  score={score:.4f}  {bar}")
@@ -559,31 +572,47 @@ def _run_autofocus():
         best_pos, best_score = max(results, key=lambda r: r[1])
         log(f"  * best: focus={best_pos} (score={best_score:.4f})", "af-good")
 
-        # Fine sweep
+        # Fine sweep — ±15 around best, step 5, 3-frame median
         log("")
-        log("--- Fine sweep ---", "af-header")
-        fine_lo = max(0, best_pos - 10)
-        fine_hi = min(255, best_pos + 10)
-        coarse_set = {r[0] for r in results}
-        fine_positions = [p for p in range(fine_lo, fine_hi + 1, 5) if p not in coarse_set]
+        log("--- Fine sweep (3-frame median) ---", "af-header")
+        fine_lo = max(0, best_pos - 15)
+        fine_hi = min(255, best_pos + 15)
+        tested = {r[0] for r in results}
+        fine_positions = [p for p in range(fine_lo, fine_hi + 1, 5) if p not in tested]
         for pos in fine_positions:
             cam.set_ctrl("focus_absolute", pos)
-            time.sleep(0.3)
-            frame = _capture_frame()
-            score = _laplacian_score(frame, bbox)
+            time.sleep(0.4)
+            score = _score_position(bbox, n=3)
+            results.append((pos, score))
+            bar = chr(9608) * int(score * 30)
+            log(f"  focus={pos:3d}  score={score:.4f}  {bar}")
+
+        best_pos, best_score = max(results, key=lambda r: r[1])
+        log(f"  * best: focus={best_pos} (score={best_score:.4f})", "af-good")
+
+        # Micro sweep — ±5 around best, step 2, 5-frame median
+        log("")
+        log("--- Micro sweep (5-frame median) ---", "af-header")
+        micro_lo = max(0, best_pos - 5)
+        micro_hi = min(255, best_pos + 5)
+        tested = {r[0] for r in results}
+        micro_positions = [p for p in range(micro_lo, micro_hi + 1, 2) if p not in tested]
+        for pos in micro_positions:
+            cam.set_ctrl("focus_absolute", pos)
+            time.sleep(0.4)
+            score = _score_position(bbox, n=5)
             results.append((pos, score))
             bar = chr(9608) * int(score * 30)
             log(f"  focus={pos:3d}  score={score:.4f}  {bar}")
 
         best_pos, best_score = max(results, key=lambda r: r[1])
 
-        # Verify
+        # Verify — 5-frame median
         log("")
-        log("--- Verify ---", "af-header")
+        log("--- Verify (5-frame median) ---", "af-header")
         cam.set_ctrl("focus_absolute", best_pos)
-        time.sleep(0.4)
-        frame = _capture_frame()
-        final_score = _laplacian_score(frame, bbox)
+        time.sleep(0.5)
+        final_score = _score_position(bbox, n=5)
         log(f"  focus={best_pos}  score={final_score:.4f}", "af-good")
 
         log("")
@@ -638,8 +667,14 @@ async def autofocus_status():
             id="af-panel", cls="af-panel",
         )
 
-    # Done — sync sliders for restored zoom/pan/tilt + final focus
-    final_values = {"zoom_absolute": 150, "pan_absolute": 0, "tilt_absolute": 0}
+    # Done — sync sliders for all restored settings + final focus
+    final_values = {
+        "zoom_absolute": 150, "pan_absolute": 0, "tilt_absolute": 0,
+        "focus_automatic_continuous": 0, "sharpness": 180,
+        "brightness": 128, "contrast": 128, "saturation": 128,
+        "gain": 0, "backlight_compensation": 1,
+        "auto_exposure": 3, "white_balance_automatic": 1,
+    }
     if _af_final_focus is not None:
         final_values["focus_absolute"] = _af_final_focus
     elements.append(Script(_slider_js(final_values)))
