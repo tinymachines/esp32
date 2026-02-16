@@ -537,8 +537,9 @@ def _run_autofocus():
             "zoom_absolute": 150, "pan_absolute": 0, "tilt_absolute": 0,
             "focus_automatic_continuous": 0, "sharpness": 180,
             "brightness": 128, "contrast": 128, "saturation": 128,
-            "gain": 0, "backlight_compensation": 1,
-            "auto_exposure": 3, "white_balance_automatic": 1,
+            "gain": 0, "backlight_compensation": 0,
+            "auto_exposure": 1, "exposure_time_absolute": 250,
+            "white_balance_automatic": 0, "white_balance_temperature": 4000,
         }
         for name, val in restore.items():
             cam.set_ctrl(name, val)
@@ -672,8 +673,9 @@ async def autofocus_status():
         "zoom_absolute": 150, "pan_absolute": 0, "tilt_absolute": 0,
         "focus_automatic_continuous": 0, "sharpness": 180,
         "brightness": 128, "contrast": 128, "saturation": 128,
-        "gain": 0, "backlight_compensation": 1,
-        "auto_exposure": 3, "white_balance_automatic": 1,
+        "gain": 0, "backlight_compensation": 0,
+        "auto_exposure": 1, "exposure_time_absolute": 250,
+        "white_balance_automatic": 0, "white_balance_temperature": 4000,
     }
     if _af_final_focus is not None:
         final_values["focus_absolute"] = _af_final_focus
