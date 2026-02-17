@@ -7,6 +7,7 @@ Visit: http://localhost:3000
 
 import base64
 import random
+import re
 import shutil
 import subprocess
 import threading
@@ -31,9 +32,11 @@ BASE_DIR = Path(__file__).resolve().parent
 SNAP_DIR = BASE_DIR / "snapshots"
 SNAP_LATEST = BASE_DIR / "snapshot.jpg"
 LOG_DIR = BASE_DIR / "logs"
+PHOTOS_DIR = BASE_DIR / "photos"
 
 SNAP_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
+PHOTOS_DIR.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Camera controls — (label, v4l2 name, min, max, step, default)
@@ -301,7 +304,7 @@ body.af-locked .btn-hero { pointer-events: none; opacity: 0.5; }
 def nav_bar(active="camera"):
     return Nav(
         A("Camera", href="/", cls="active" if active == "camera" else ""),
-        A("Game of Life", href="/life", cls="active" if active == "life" else ""),
+        A("Photos", href="/photos", cls="active" if active == "photos" else ""),
         A("Autofocus", href="/autofocus", cls="active" if active == "autofocus" else ""),
         A("Pipeline", href="/pipeline", cls="active" if active == "pipeline" else ""),
     )
@@ -471,6 +474,11 @@ def _slider_js(values: dict[str, int]) -> str:
         )
     return "".join(parts)
 
+def _save_af_photo(frame: np.ndarray, ts: int, suffix: str) -> Path:
+    path = PHOTOS_DIR / f"{ts}_{suffix}.jpg"
+    cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return path
+
 def _capture_frame() -> np.ndarray:
     """Capture a fresh frame from the shared camera (discards 2 buffered frames)."""
     with cam.lock:
@@ -580,6 +588,9 @@ def _run_autofocus():
     try:
         progress("Scrambling...")
         time.sleep(0.5)
+        af_ts = int(time.time())
+        pre_frame = _capture_frame()
+        _save_af_photo(pre_frame, af_ts, "pre")
         _af_stage = 2  # Detect
         # Restore everything except focus — leave focus as the variable
         log("Restoring camera preset (keeping random focus)...")
@@ -673,6 +684,14 @@ def _run_autofocus():
         time.sleep(0.5)
         final_score = _score_position(bbox, n=5)
         log(f"  focus={best_pos}  score={final_score:.4f}", "af-good")
+
+        # Save post-autofocus photo with green bounding box + OLED crop
+        post_frame = _capture_frame()
+        post_annotated = post_frame.copy()
+        bx, by, bw, bh = bbox
+        cv2.rectangle(post_annotated, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
+        _save_af_photo(post_annotated, af_ts, "post")
+        _save_af_photo(post_frame[by:by+bh, bx:bx+bw], af_ts, "oled")
 
         log("")
         log(f"Done! Best focus = {best_pos}  (score = {final_score:.4f})", "af-best")
@@ -790,25 +809,76 @@ async def snapshot_jpg():
     return Response("No snapshot yet", status_code=404)
 
 
-@rt("/life")
-def life():
+@rt("/photos")
+def photos_page():
+    # Find all pre-images, sorted newest-first, limit 20
+    pre_files = sorted(PHOTOS_DIR.glob("*_pre.jpg"), reverse=True)[:20]
+    if not pre_files:
+        return (
+            Title("Photos — Autofocus Runs"),
+            Style(CSS),
+            H1("Photos // Autofocus Runs"),
+            nav_bar("photos"),
+            Div(
+                P("No runs yet — go to Camera and click ",
+                  Strong("Randomize + Autofocus"), " to capture your first set.",
+                  style="color:#888;font-size:0.9rem;margin-top:40px;text-align:center;"),
+                style="max-width:900px;margin:0 auto;",
+            ),
+        )
+    cards = []
+    for pre_path in pre_files:
+        ts_str = pre_path.stem.rsplit("_", 1)[0]
+        ts = int(ts_str)
+        date_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        post_name = f"{ts_str}_post.jpg"
+        oled_name = f"{ts_str}_oled.jpg"
+        pre_name = pre_path.name
+        cards.append(
+            Div(
+                Div(f"#{ts_str}", style="color:#0a0;font-size:0.85rem;font-weight:bold;"),
+                Div(date_str, style="color:#666;font-size:0.75rem;margin-bottom:8px;"),
+                Div(
+                    Div(
+                        Img(src=f"/photos/{pre_name}", style="width:100%;border:1px solid #333;border-radius:2px;"),
+                        Div("Pre (scrambled)", style="color:#888;font-size:0.7rem;margin-top:4px;"),
+                        style="text-align:center;",
+                    ),
+                    Div(
+                        Img(src=f"/photos/{post_name}", style="width:100%;border:1px solid #333;border-radius:2px;"),
+                        Div("Post (focused)", style="color:#888;font-size:0.7rem;margin-top:4px;"),
+                        style="text-align:center;",
+                    ),
+                    Div(
+                        Img(src=f"/photos/{oled_name}", style="width:100%;border:1px solid #333;border-radius:2px;image-rendering:pixelated;"),
+                        Div("OLED crop", style="color:#888;font-size:0.7rem;margin-top:4px;"),
+                        style="text-align:center;",
+                    ),
+                    style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;",
+                ),
+                style="background:#0a0a0a;border:1px solid #333;border-radius:4px;padding:12px 16px;margin-bottom:16px;",
+            )
+        )
     return (
-        Title("ESP32-C6 Game of Life"),
+        Title("Photos — Autofocus Runs"),
         Style(CSS),
-        H1("ESP32-C6 // Conway's Game of Life"),
-        nav_bar("life"),
-        Div(
-            Img(id="snapshot", src="/snapshot.jpg", style="max-width:100%;max-height:70vh;border:2px solid #333;border-radius:4px;"),
-            Div("Auto-refreshes every 5 seconds", style="color:#888;font-size:0.85rem;margin-top:12px;"),
-            Button("Refresh Now", cls="btn", onclick="refresh()"),
-            style="text-align:center;padding:20px;",
-        ),
-        Script("""
-            function refresh() {
-                document.getElementById('snapshot').src = '/snapshot.jpg?' + Date.now();
-            }
-            setInterval(refresh, 5000);
-        """),
+        H1("Photos // Autofocus Runs"),
+        nav_bar("photos"),
+        Div(*cards, style="max-width:1100px;margin:0 auto;"),
+    )
+
+
+@rt("/photos/{filename}")
+async def photos_file(filename: str):
+    if not re.fullmatch(r"[a-zA-Z0-9_.]+", filename) or not filename.endswith(".jpg"):
+        return Response("Not found", status_code=404)
+    path = PHOTOS_DIR / filename
+    if not path.exists():
+        return Response("Not found", status_code=404)
+    return FileResponse(
+        path,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
     )
 
 # ---------------------------------------------------------------------------

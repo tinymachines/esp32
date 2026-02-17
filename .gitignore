@@ -8,6 +8,7 @@ __pycache__/
 # Camera artifacts
 camera/snapshot.jpg
 camera/snapshots/
+camera/photos/
 camera/snapshot_*.jpg
 camera/logs/
 camera/monitor/
