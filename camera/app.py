@@ -172,6 +172,11 @@ _af_offset = 0                         # focus offset applied after sweep (compe
 _NORM_SIZE = (64, 32)                  # fixed crop size (w, h) for scale invariance
 _LAPLACIAN_DIVISOR = 25000.0           # tuned for 64x32 CLAHE-normalized OLED crop (bumped to avoid saturation at 1.0)
 _EDGE_MARGIN_PX = 2                    # bbox within this of frame edge = clipped
+_CROP_COARSE = 20                      # progressive crop sizes per sweep phase
+_CROP_FINE = 30
+_CROP_MICRO = 40
+_CROP_ULTRA = 40
+_BAIL_DOMINANCE = 1.5                  # best must be ≥1.5x second-best to bail early
 
 # ---------------------------------------------------------------------------
 # FastHTML app
@@ -315,8 +320,7 @@ def nav_bar(active="camera"):
     return Nav(
         A("Camera", href="/", cls="active" if active == "camera" else ""),
         A("Photos", href="/photos", cls="active" if active == "photos" else ""),
-        A("Autofocus", href="/autofocus", cls="active" if active == "autofocus" else ""),
-        A("Pipeline", href="/pipeline", cls="active" if active == "pipeline" else ""),
+        A("Docs", href="/docs", cls="active" if active == "docs" else ""),
     )
 
 
@@ -603,6 +607,40 @@ def _find_oled_rect(frame: np.ndarray):
         return None
     return (x, y, w, h)
 
+def _find_focus_center(frame: np.ndarray) -> tuple[int, int]:
+    """Find center of nearest bright cluster for focus targeting. Returns (cx, cy)."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (90, 50, 30), (130, 255, 255))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    fh, fw = frame.shape[:2]
+    fcx, fcy = fw // 2, fh // 2
+    # Filter contours > 50px area, pick closest to frame center
+    candidates = []
+    for c in contours:
+        if cv2.contourArea(c) < 50:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        ccx, ccy = x + w // 2, y + h // 2
+        dist = (ccx - fcx) ** 2 + (ccy - fcy) ** 2
+        candidates.append((dist, ccx, ccy))
+    if candidates:
+        candidates.sort()
+        _, cx, cy = candidates[0]
+        return (cx, cy)
+    # Fallback: frame center
+    return (fcx, fcy)
+
+def _make_crop_bbox(cx: int, cy: int, size: int, frame_shape) -> tuple[int, int, int, int]:
+    """Create a size x size square bbox centered at (cx, cy), clamped to frame bounds."""
+    fh, fw = frame_shape[:2]
+    x = max(0, min(cx - size // 2, fw - size))
+    y = max(0, min(cy - size // 2, fh - size))
+    w = min(size, fw - x)
+    h = min(size, fh - y)
+    return (x, y, w, h)
+
 def _center_crop_rect(frame: np.ndarray):
     h, w = frame.shape[:2]
     cw, ch = int(w * 0.4), int(h * 0.4)
@@ -624,6 +662,51 @@ def _check_bbox_clipping(frame: np.ndarray, bbox) -> bool:
     return (x <= _EDGE_MARGIN_PX or y <= _EDGE_MARGIN_PX
             or (x + w) >= (fw - _EDGE_MARGIN_PX)
             or (y + h) >= (fh - _EDGE_MARGIN_PX))
+
+def _detect_grid_rotation(frame: np.ndarray, cx: int, cy: int) -> float | None:
+    """Detect OLED pixel grid angle from a 60x60 crop around (cx, cy).
+
+    Returns median angle in degrees if ≥10 pixel-shaped contours found, else None.
+    """
+    fh, fw = frame.shape[:2]
+    half = 30
+    x0 = max(0, min(cx - half, fw - 2 * half))
+    y0 = max(0, min(cy - half, fh - 2 * half))
+    crop = frame[y0:y0 + 2 * half, x0:x0 + 2 * half]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    angles = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 4 or area > 100:
+            continue
+        if len(c) < 5:
+            continue
+        rect = cv2.minAreaRect(c)
+        w, h = rect[1]
+        if min(w, h) < 0.1:
+            continue
+        aspect = max(w, h) / min(w, h)
+        if aspect > 2.5:
+            continue
+        angle = rect[2]
+        # Normalize to [-45, 45]
+        if angle > 45:
+            angle -= 90
+        elif angle < -45:
+            angle += 90
+        angles.append(angle)
+    if len(angles) >= 10:
+        return float(np.median(angles))
+    return None
+
+def _deskew_frame(frame: np.ndarray, angle_deg: float) -> np.ndarray:
+    """Rotate frame by -angle_deg around its center to deskew."""
+    h, w = frame.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle_deg, 1.0)
+    return cv2.warpAffine(frame, M, (w, h), flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_REPLICATE)
 
 def _laplacian_score(frame: np.ndarray, bbox) -> float:
     """Laplacian variance sharpness score, normalized to [0, 1]."""
@@ -704,25 +787,20 @@ def _run_autofocus(initial_values: dict):
             cam.set_ctrl(name, val)
         time.sleep(1.2)  # settle for zoom motor + image pipeline
 
-        progress("Detecting OLED...")
-        log("Detecting OLED region at focus=30...")
+        # --- Pass 1: find focus center ---
+        progress("Finding focus center...")
+        log("Finding focus center at focus=30...")
         cam.set_ctrl("focus_absolute", 30)
         time.sleep(_af_settle_s)
         frame = _capture_frame()
-        bbox = _find_oled_rect(frame)
-        if bbox:
-            x, y, w, h = bbox
-            log(f"  OLED found: {w}x{h} at ({x},{y})", "af-good")
-            if _check_bbox_clipping(frame, bbox):
-                log(f"  Warning: OLED bbox touches frame edge (partial visibility)", "af-warn")
-        else:
-            log("  OLED not detected, using center crop", "af-warn")
-            bbox = _center_crop_rect(frame)
+        focus_cx, focus_cy = _find_focus_center(frame)
+        log(f"  Focus center: ({focus_cx}, {focus_cy})", "af-good")
 
         # Coarse sweep — every 20 steps across full range, 3-frame avg
         _af_stage = 3  # Coarse
+        bbox = _make_crop_bbox(focus_cx, focus_cy, _CROP_COARSE, frame.shape)
         log("")
-        log("--- Coarse sweep (3-frame avg) ---", "af-header")
+        log(f"--- Coarse sweep (3-frame avg, {_CROP_COARSE}x{_CROP_COARSE} crop) ---", "af-header")
         coarse = list(range(0, 256, 20))  # [0, 20, 40, ..., 240]
         results = []
         for i, pos in enumerate(coarse):
@@ -737,51 +815,73 @@ def _run_autofocus(initial_values: dict):
         best_pos, best_score = max(results, key=lambda r: r[1])
         log(f"  * best: focus={best_pos} (score={best_score:.4f})", "af-good")
 
-        # Fine sweep — ±15 around best, step 5, 5-frame avg
-        _af_stage = 4  # Fine
-        log("")
-        log("--- Fine sweep (5-frame avg) ---", "af-header")
-        fine_lo = max(0, best_pos - 15)
-        fine_hi = min(255, best_pos + 15)
-        tested = {r[0] for r in results}
-        fine_positions = [p for p in range(fine_lo, fine_hi + 1, 5) if p not in tested]
-        for i, pos in enumerate(fine_positions):
-            progress(f"Fine {i+1}/{len(fine_positions)}")
-            cam.set_ctrl("focus_absolute", pos)
-            time.sleep(_af_settle_s)
-            score = _score_position(bbox, n=5)
-            results.append((pos, score))
-            bar = chr(9608) * int(score * 30)
-            log(f"  focus={pos:3d}  score={score:.4f}  {bar}")
+        # Bail check after coarse
+        bail_to_ultra = False
+        sorted_scores = sorted([s for _, s in results], reverse=True)
+        if len(sorted_scores) >= 3 and sorted_scores[1] > 0:
+            dominance = sorted_scores[0] / sorted_scores[1]
+            if dominance >= _BAIL_DOMINANCE:
+                log(f"  Early bail: dominance {dominance:.2f}x (≥{_BAIL_DOMINANCE}x), skipping fine+micro", "af-warn")
+                bail_to_ultra = True
 
-        best_pos, best_score = max(results, key=lambda r: r[1])
-        log(f"  * best: focus={best_pos} (score={best_score:.4f})", "af-good")
+        if not bail_to_ultra:
+            # Fine sweep — ±15 around best, step 5, 5-frame avg
+            _af_stage = 4  # Fine
+            bbox = _make_crop_bbox(focus_cx, focus_cy, _CROP_FINE, frame.shape)
+            log("")
+            log(f"--- Fine sweep (5-frame avg, {_CROP_FINE}x{_CROP_FINE} crop) ---", "af-header")
+            fine_lo = max(0, best_pos - 15)
+            fine_hi = min(255, best_pos + 15)
+            tested = {r[0] for r in results}
+            fine_positions = [p for p in range(fine_lo, fine_hi + 1, 5) if p not in tested]
+            for i, pos in enumerate(fine_positions):
+                progress(f"Fine {i+1}/{len(fine_positions)}")
+                cam.set_ctrl("focus_absolute", pos)
+                time.sleep(_af_settle_s)
+                score = _score_position(bbox, n=5)
+                results.append((pos, score))
+                bar = chr(9608) * int(score * 30)
+                log(f"  focus={pos:3d}  score={score:.4f}  {bar}")
 
-        # Micro sweep — ±5 around best, step 2, 5-frame avg
-        log("")
-        log("--- Micro sweep (5-frame avg) ---", "af-header")
-        micro_lo = max(0, best_pos - 5)
-        micro_hi = min(255, best_pos + 5)
-        tested = {r[0] for r in results}
-        micro_positions = [p for p in range(micro_lo, micro_hi + 1, 2) if p not in tested]
-        for i, pos in enumerate(micro_positions):
-            progress(f"Micro {i+1}/{len(micro_positions)}")
-            cam.set_ctrl("focus_absolute", pos)
-            time.sleep(_af_settle_s)
-            score = _score_position(bbox, n=5)
-            results.append((pos, score))
-            bar = chr(9608) * int(score * 30)
-            log(f"  focus={pos:3d}  score={score:.4f}  {bar}")
+            best_pos, best_score = max(results, key=lambda r: r[1])
+            log(f"  * best: focus={best_pos} (score={best_score:.4f})", "af-good")
 
-        # Pick best from micro range only (prevents overshoot from noisy coarse/fine scores)
-        micro_results = [(p, s) for p, s in results if micro_lo <= p <= micro_hi]
-        best_pos, best_score = max(micro_results, key=lambda r: r[1])
-        log(f"  * best: focus={best_pos} (score={best_score:.4f})", "af-good")
+            # Bail check after fine
+            fine_scores = sorted([s for _, s in results], reverse=True)
+            if len(fine_scores) >= 3 and fine_scores[1] > 0:
+                dominance = fine_scores[0] / fine_scores[1]
+                if dominance >= _BAIL_DOMINANCE:
+                    log(f"  Early bail: dominance {dominance:.2f}x (≥{_BAIL_DOMINANCE}x), skipping micro", "af-warn")
+                    bail_to_ultra = True
 
-        # Ultra sweep — ±2 around micro best, step 1, 5-frame avg
+        if not bail_to_ultra:
+            # Micro sweep — ±5 around best, step 2, 5-frame avg
+            bbox = _make_crop_bbox(focus_cx, focus_cy, _CROP_MICRO, frame.shape)
+            log("")
+            log(f"--- Micro sweep (5-frame avg, {_CROP_MICRO}x{_CROP_MICRO} crop) ---", "af-header")
+            micro_lo = max(0, best_pos - 5)
+            micro_hi = min(255, best_pos + 5)
+            tested = {r[0] for r in results}
+            micro_positions = [p for p in range(micro_lo, micro_hi + 1, 2) if p not in tested]
+            for i, pos in enumerate(micro_positions):
+                progress(f"Micro {i+1}/{len(micro_positions)}")
+                cam.set_ctrl("focus_absolute", pos)
+                time.sleep(_af_settle_s)
+                score = _score_position(bbox, n=5)
+                results.append((pos, score))
+                bar = chr(9608) * int(score * 30)
+                log(f"  focus={pos:3d}  score={score:.4f}  {bar}")
+
+            # Pick best from micro range only (prevents overshoot from noisy coarse/fine scores)
+            micro_results = [(p, s) for p, s in results if micro_lo <= p <= micro_hi]
+            best_pos, best_score = max(micro_results, key=lambda r: r[1])
+            log(f"  * best: focus={best_pos} (score={best_score:.4f})", "af-good")
+
+        # Ultra sweep — ±2 around best, step 1, 5-frame avg (always runs)
         _af_stage = 5  # Ultra
+        bbox = _make_crop_bbox(focus_cx, focus_cy, _CROP_ULTRA, frame.shape)
         log("")
-        log("--- Ultra sweep (5-frame avg, step 1) ---", "af-header")
+        log(f"--- Ultra sweep (5-frame avg, step 1, {_CROP_ULTRA}x{_CROP_ULTRA} crop) ---", "af-header")
         ultra_lo = max(0, best_pos - 2)
         ultra_hi = min(255, best_pos + 2)
         tested = {r[0] for r in results}
@@ -805,6 +905,37 @@ def _run_autofocus(initial_values: dict):
             best_pos = max(0, min(255, best_pos + _af_offset))
             log(f"  + offset {_af_offset:+d} → focus={best_pos}", "af-info")
 
+        # --- Grid rotation detection ---
+        cam.set_ctrl("focus_absolute", best_pos)
+        time.sleep(_af_settle_s)
+        frame = _capture_frame()
+        log("")
+        log("--- Grid rotation detection ---", "af-header")
+        grid_angle = _detect_grid_rotation(frame, focus_cx, focus_cy)
+        if grid_angle is not None:
+            log(f"  Grid angle: {grid_angle:.1f} degrees", "af-good")
+        else:
+            log("  Grid angle: not detected (insufficient pixel samples)", "af-warn")
+
+        # --- Re-detect OLED (deskewed if angle found) ---
+        log("")
+        if grid_angle is not None and abs(grid_angle) > 0.5:
+            log("--- Re-detect OLED (deskewed) ---", "af-header")
+            deskewed = _deskew_frame(frame, grid_angle)
+        else:
+            log("--- Re-detect OLED (sharp focus) ---", "af-header")
+            deskewed = frame
+        oled_bbox = _find_oled_rect(deskewed)
+        if oled_bbox:
+            ox, oy, ow, oh = oled_bbox
+            log(f"  OLED found: {ow}x{oh} at ({ox},{oy})", "af-good")
+            if _check_bbox_clipping(deskewed, oled_bbox):
+                log("  Warning: bbox touches frame edge", "af-warn")
+            bbox = oled_bbox
+        else:
+            log("  OLED not detected, using focus crop fallback", "af-warn")
+            bbox = _make_crop_bbox(focus_cx, focus_cy, _CROP_ULTRA, frame.shape)
+
         # Verify — 5-frame avg
         _af_stage = 6  # Focus
         progress("Verifying...")
@@ -817,6 +948,8 @@ def _run_autofocus(initial_values: dict):
 
         # Save post-autofocus photo with green bounding box + OLED crop
         post_frame = _capture_frame()
+        if grid_angle is not None and abs(grid_angle) > 0.5:
+            post_frame = _deskew_frame(post_frame, grid_angle)
         post_annotated = post_frame.copy()
         bx, by, bw, bh = bbox
         cv2.rectangle(post_annotated, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
@@ -831,7 +964,13 @@ def _run_autofocus(initial_values: dict):
             "final": {
                 "focus_absolute": best_pos,
                 "score": round(final_score, 4),
+                "grid_angle_deg": round(grid_angle, 2) if grid_angle is not None else None,
                 **restore,
+            },
+            "focus_center": {"x": focus_cx, "y": focus_cy},
+            "crop_sizes": {
+                "coarse": _CROP_COARSE, "fine": _CROP_FINE,
+                "micro": _CROP_MICRO, "ultra": _CROP_ULTRA,
             },
             "oled_bbox": {"x": bx, "y": by, "w": bw, "h": bh},
         }
@@ -1239,16 +1378,12 @@ flowchart LR
         F --> G["SharpnessNet\\nAdam, 200 steps"]
         G --> H["safetensors\\n15 KB"]
     end
-    subgraph focus["Autofocus (live, ~13s)"]
-        I["Camera\\n1280×720"] --> J["Find OLED\\nHSV threshold"]
-        J --> K["Crop & Resize\\n32×64"]
-        K --> L["Laplacian\\nvariance"]
-        K --> M["CNN\\ninference"]
-        H --> M
-        L --> N["0.7·Lap + 0.3·CNN"]
-        M --> N
-        N --> O["Coarse→Fine\\nsweep"]
-        O --> P["Set Focus\\nv4l2-ctl"]
+    subgraph focus["Autofocus (live)"]
+        I["Camera\\n1280×720"] --> J["Find Focus\\nCenter"]
+        J --> K["4-Phase Sweep\\nCoarse→Fine→\\nMicro→Ultra"]
+        K --> L["Grid Angle\\nDetection"]
+        L --> M["Deskew +\\nOLED Re-detect"]
+        M --> N["Set Focus\\nv4l2-ctl"]
     end
 """
 
@@ -1266,8 +1401,13 @@ flowchart TD
     style I fill:#1a2a1a,stroke:#0a0,color:#0f0
 """
 
-@rt("/pipeline")
-def pipeline_page():
+@rt("/docs")
+def docs_page():
+    model_path = BASE_DIR / "autofocus_model.safetensors"
+    model_exists = model_path.exists()
+    model_size = f"{model_path.stat().st_size / 1024:.1f} KB" if model_exists else "not trained"
+    model_date = time.strftime("%Y-%m-%d %H:%M", time.localtime(model_path.stat().st_mtime)) if model_exists else "—"
+
     # --- Generate sample images ---
     blur_sigmas = [0.0, 0.5, 1.5, 2.5, 4.0]
     blur_samples = []
@@ -1318,19 +1458,125 @@ def pipeline_page():
     )
 
     return (
-        Title("ML Pipeline — Data → Training → Autofocus"),
+        Title("OLED Autofocus — System Documentation"),
         Style(CSS),
         Script(mermaid_js, type="module"),
-        H1("ML Pipeline // Data → Training → Autofocus"),
-        nav_bar("pipeline"),
+        H1("OLED Autofocus // System Documentation"),
+        nav_bar("docs"),
         Div(
+            # ---- Intro ----
+            P("Automated focus for a Logitech BRIO camera pointing at an SSD1306 128x64 OLED "
+              "running Conway's Game of Life on an ESP32-C6. Combines Laplacian variance scoring "
+              "with a four-phase progressive sweep, early bail on dominant peaks, "
+              "and grid rotation detection for deskewed OLED re-detection."),
+            Div(
+                Span("tinygrad", cls="tag"), Span("OpenCV", cls="tag"),
+                Span("v4l2-ctl", cls="tag"), Span("ESP32-C6", cls="tag"),
+                Span("SSD1306 OLED", cls="tag"), Span("Logitech BRIO", cls="tag"),
+            ),
+
+            # ---- Hardware ----
+            H2("Hardware Setup"),
+            Table(
+                Tr(Th("Component"), Th("Details")),
+                Tr(Td("Camera"), Td("Logitech BRIO 4K, /dev/video1, 1280x720 @ 15fps MJPG")),
+                Tr(Td("Focus control"), Td("Manual via v4l2-ctl: focus_absolute 0–255")),
+                Tr(Td("Target display"), Td("SSD1306 0.96\" OLED, 128x64 pixels, I2C (GPIO6 SDA, GPIO7 SCL)")),
+                Tr(Td("Microcontroller"), Td("ESP32-C6-DevKitC-1-N8, RISC-V, running Game of Life firmware")),
+                Tr(Td("Focus scene"), Td("Blue OLED pixels on black + starburst calibration card behind")),
+            ),
+
             # ---- End-to-End Flow ----
             H2("End-to-End Flow"),
-            P("Two phases: offline training on synthetic data (~35s), then live autofocus via "
-              "coarse-to-fine sweep (~13s). No real camera images needed for training."),
+            P("Two phases: offline CNN training on synthetic data (~35s), then live autofocus "
+              "via progressive four-phase sweep. No real camera images needed for training."),
             Div(NotStr(f'<pre class="mermaid">\n{MERMAID_PIPELINE}\n</pre>'), cls="mermaid-wrap"),
 
-            # ---- Synthetic Data ----
+            # ---- Autofocus Algorithm ----
+            H2("Autofocus Algorithm"),
+            P("Six-stage pipeline: Scramble, Detect, Coarse, Fine, Ultra, Focus. "
+              "Each sweep phase uses a progressively larger crop around the detected focus center "
+              "for better signal discrimination."),
+
+            H3("Focus Detection"),
+            P("HSV blue threshold finds bright clusters in the camera frame. "
+              "The center point of the nearest cluster to frame center is used as the "
+              "focus target — a single (cx, cy) coordinate, not a bounding box. "
+              "Fallback: frame center."),
+
+            H3("Four-Phase Sweep"),
+            P("Each phase builds its own crop box around the focus center. "
+              "Smaller crops give more focused Laplacian signal in early phases; "
+              "larger crops provide better discrimination in later phases:"),
+            Table(
+                Tr(Th("Phase"), Th("Crop"), Th("Range"), Th("Step"), Th("Avg Frames")),
+                Tr(Td("1. Coarse"), Td("20x20"), Td("0–255"), Td("20"), Td("3")),
+                Tr(Td("2. Fine"), Td("30x30"), Td("best ± 15"), Td("5"), Td("5")),
+                Tr(Td("3. Micro"), Td("40x40"), Td("best ± 5"), Td("2"), Td("5")),
+                Tr(Td("4. Ultra"), Td("40x40"), Td("best ± 2"), Td("1"), Td("5")),
+            ),
+
+            H3("Early Bail"),
+            P("After coarse and fine sweeps, if the best score is ", Code("≥ 1.5x"),
+              " the second-best (with at least 3 results), the algorithm skips "
+              "intermediate phases and jumps straight to ultra. "
+              "Ultra always runs — it's only ~5 positions. This can cut sweep time significantly "
+              "when the focus peak is unambiguous."),
+
+            H3("Grid Rotation Detection"),
+            P("At sharp focus, individual OLED pixels appear as crisp rectangles. "
+              "Their orientation reveals the physical grid angle (~15–20° in the current setup):"),
+            Ul(
+                Li("Take a 60x60 crop around the focus center"),
+                Li("Convert to grayscale, Otsu threshold to binary"),
+                Li("Find contours, filter to pixel-sized blobs (area 4–100px², aspect < 2.5)"),
+                Li(Code("cv2.minAreaRect"), " for each contour — collect angles"),
+                Li("Normalize angles to [-45°, 45°], return median if ≥ 10 samples"),
+            ),
+            P("If detected (|angle| > 0.5°), the frame is deskewed via ", Code("cv2.warpAffine"),
+              " before OLED re-detection. This produces tighter, axis-aligned bounding boxes "
+              "and cleaner OLED crops."),
+
+            H3("OLED Re-detection"),
+            P("After the sweep finds best focus and applies any offset, the OLED is "
+              "re-detected on the (possibly deskewed) sharp frame using the full HSV "
+              "pipeline. The post-autofocus photo and OLED crop use this refined bbox. "
+              "If the OLED isn't found, the focus crop is used as fallback."),
+
+            # ---- Scoring ----
+            H2("Sharpness Scoring"),
+            H3("OLED Detection (HSV)"),
+            P("Classical CV pipeline finds the blue OLED region in the camera frame:"),
+            Table(
+                Tr(Th("Step"), Th("Details")),
+                Tr(Td("Color space"), Td("BGR → HSV")),
+                Tr(Td("Threshold"), Td("H: 90–130, S: 50–255, V: 30–255 (blue glow)")),
+                Tr(Td("Morphology"), Td("Dilate with 7x7 rect kernel, 2 iterations")),
+                Tr(Td("Contour"), Td("Largest contour, area > 500px, aspect ratio 1.3–3.0")),
+                Tr(Td("Fallback"), Td("Focus crop bbox if OLED not detected")),
+            ),
+            H3("Laplacian Score"),
+            P("Crops are extracted, resized to 64x32, CLAHE-normalized, then scored "
+              "via Laplacian variance. Multi-frame averaging (3–5 frames per position) "
+              "cancels OLED refresh flicker and sensor noise:"),
+            Div("score = min(Laplacian(crop).var() / 25000, 1.0)", cls="formula"),
+
+            # ---- SharpnessNet ----
+            H2("SharpnessNet (CNN)"),
+            P("A 3-layer CNN with global average pooling. Trained on synthetic Game of Life "
+              "frames, predicts sharpness in [0, 1]. 3,585 parameters, 15 KB on disk:"),
+            Div(NotStr(f'<pre class="mermaid">\n{MERMAID_MODEL}\n</pre>'), cls="mermaid-wrap"),
+            Table(
+                Tr(Th("Layer"), Th("Operation"), Th("Output"), Th("Params")),
+                Tr(Td("1"), Td("Conv2d(1→8, 3×3) + ReLU + MaxPool"), Td("8 × 16 × 32"), Td("80", cls="mono")),
+                Tr(Td("2"), Td("Conv2d(8→16, 3×3) + ReLU + MaxPool"), Td("16 × 8 × 16"), Td("1,168", cls="mono")),
+                Tr(Td("3"), Td("Conv2d(16→16, 3×3) + ReLU"), Td("16 × 8 × 16"), Td("2,320", cls="mono")),
+                Tr(Td("4"), Td("GlobalAvgPool"), Td("16"), Td("0", cls="mono")),
+                Tr(Td("5"), Td("Linear(16→1) + Sigmoid"), Td("1"), Td("17", cls="mono")),
+                Tr(Td(""), Td(Strong("Total")), Td(""), Td(Strong("3,585"), cls="mono")),
+            ),
+
+            # ---- Training Data ----
             H2("Synthetic Training Data"),
             P("Each sample is a Game of Life frame rendered at 64×128, resized to 32×64, "
               "then degraded with Gaussian blur and sensor noise. The sharpness label is "
@@ -1365,7 +1611,6 @@ def pipeline_page():
               "evolution steps 0–20, blur sigma uniform in 0–4. "
               "Generated in ~5s on a Raspberry Pi 5."),
 
-            # ---- Label Formula ----
             H3("Sharpness Label"),
             P("The label maps blur sigma to a sharpness score in [0, 1]:"),
             Div("label = 1 / (1 + σ²)", cls="formula"),
@@ -1374,41 +1619,22 @@ def pipeline_page():
                 Tr(Td("label"), Td("1.000", cls="mono"), Td("0.800", cls="mono"),
                    Td("0.500", cls="mono"), Td("0.200", cls="mono"), Td("0.059", cls="mono")),
             ),
-            P("This gives a smooth, monotonically decreasing curve: sharp images → 1.0, "
-              "heavily blurred → near 0. The inverse-quadratic shape was chosen because "
-              "perceived sharpness drops quickly with initial defocus, then plateaus."),
-
-            # ---- Model Architecture ----
-            H2("SharpnessNet Architecture"),
-            P("Three conv layers with max-pooling progressively reduce spatial dimensions. "
-              "Global average pooling replaces a fully-connected classifier, keeping "
-              "the total parameter count at just 3,585:"),
-            Div(NotStr(f'<pre class="mermaid">\n{MERMAID_MODEL}\n</pre>'), cls="mermaid-wrap"),
-            Table(
-                Tr(Th("Layer"), Th("Operation"), Th("Output"), Th("Params")),
-                Tr(Td("1"), Td("Conv2d(1→8, 3×3) + ReLU + MaxPool"), Td("8 × 16 × 32"), Td("80", cls="mono")),
-                Tr(Td("2"), Td("Conv2d(8→16, 3×3) + ReLU + MaxPool"), Td("16 × 8 × 16"), Td("1,168", cls="mono")),
-                Tr(Td("3"), Td("Conv2d(16→16, 3×3) + ReLU"), Td("16 × 8 × 16"), Td("2,320", cls="mono")),
-                Tr(Td("4"), Td("GlobalAvgPool"), Td("16"), Td("0", cls="mono")),
-                Tr(Td("5"), Td("Linear(16→1) + Sigmoid"), Td("1"), Td("17", cls="mono")),
-                Tr(Td(""), Td(Strong("Total")), Td(""), Td(Strong("3,585"), cls="mono")),
-            ),
 
             # ---- Training Loss ----
-            H2("Training Loss"),
-            P("MSE loss over 200 Adam steps (batch size 128, lr=1e-3). "
-              "Loss drops from 0.14 to ~0.01 in the first 80 steps, "
-              "then plateaus — the model converges fast on this simple task:"),
-            Div(NotStr(loss_svg), cls="chart-wrap"),
+            H2("Training"),
             Table(
-                Tr(Th("Metric"), Th("Value")),
-                Tr(Td("Initial loss"), Td("0.1379", cls="mono")),
-                Tr(Td("Final loss"), Td("0.0149", cls="mono")),
-                Tr(Td("Best loss"), Td("0.0093 (step 180)", cls="mono")),
-                Tr(Td("Convergence"), Td("~80 steps to reach < 0.02")),
-                Tr(Td("Wall time"), Td("29.4s on RPi5 CPU (tinygrad)")),
-                Tr(Td("Model size"), Td("15 KB (safetensors)")),
+                Tr(Th("Parameter"), Th("Value")),
+                Tr(Td("Optimizer"), Td("Adam")),
+                Tr(Td("Learning rate"), Td(Code("1e-3"))),
+                Tr(Td("Batch size"), Td("128")),
+                Tr(Td("Training steps"), Td("200")),
+                Tr(Td("Loss function"), Td("MSE (mean squared error)")),
+                Tr(Td("Wall time"), Td("~30s on Raspberry Pi 5 CPU (tinygrad)")),
+                Tr(Td("Model size"), Td(f"{model_size} (safetensors)")),
+                Tr(Td("Last trained"), Td(model_date)),
             ),
+            P("MSE loss over 200 Adam steps. Converges to ~0.01 in the first 80 steps:"),
+            Div(NotStr(loss_svg), cls="chart-wrap"),
 
             # ---- Evaluation ----
             H2("Evaluation"),
@@ -1428,180 +1654,8 @@ def pipeline_page():
                    Td(Strong(f"{np.mean([r[4] for r in eval_rows]):.3f}"), cls="mono")),
             ),
 
-            H3("Why Hybrid Scoring?"),
-            P("The CNN alone is trained on synthetic data and may not generalize "
-              "perfectly to real camera frames (lens aberrations, JPEG artifacts, "
-              "ambient light reflections). The Laplacian variance is domain-agnostic — "
-              "it measures high-frequency content regardless of scene content. "
-              "Blending 70% Laplacian + 30% CNN gives the best of both: "
-              "a physically-grounded signal with a learned regularizer."),
-            Div("score = 0.7 × Laplacian(crop).var() / 500 + 0.3 × CNN(crop)", cls="formula"),
-
-            cls="af-page",
-        ),
-    )
-
-
-@rt("/autofocus")
-def autofocus_page():
-    model_path = BASE_DIR / "autofocus_model.safetensors"
-    model_exists = model_path.exists()
-    model_size = f"{model_path.stat().st_size / 1024:.1f} KB" if model_exists else "not trained"
-    model_date = time.strftime("%Y-%m-%d %H:%M", time.localtime(model_path.stat().st_mtime)) if model_exists else "—"
-
-    return (
-        Title("OLED Autofocus — CNN + Laplacian"),
-        Style(CSS),
-        H1("OLED Autofocus // CNN + Laplacian Hybrid"),
-        nav_bar("autofocus"),
-        Div(
-            # ---- Intro ----
-            P("Automated focus for a Logitech BRIO camera pointing at an SSD1306 128x64 OLED "
-              "running Conway's Game of Life on an ESP32-C6. Combines a tiny CNN trained on "
-              "synthetic data with classical Laplacian variance to score image sharpness, "
-              "then runs a coarse-to-fine sweep over the camera's manual focus range."),
-            Div(
-                Span("tinygrad", cls="tag"), Span("OpenCV", cls="tag"),
-                Span("v4l2-ctl", cls="tag"), Span("ESP32-C6", cls="tag"),
-                Span("SSD1306 OLED", cls="tag"), Span("Logitech BRIO", cls="tag"),
-            ),
-
-            # ---- Hardware ----
-            H2("Hardware Setup"),
-            Table(
-                Tr(Th("Component"), Th("Details")),
-                Tr(Td("Camera"), Td("Logitech BRIO 4K, /dev/video1, 1280x720 @ 15fps MJPG")),
-                Tr(Td("Focus control"), Td("Manual via v4l2-ctl: focus_absolute 0–255, step 5 (51 levels)")),
-                Tr(Td("Target display"), Td("SSD1306 0.96\" OLED, 128x64 pixels, I2C (GPIO6 SDA, GPIO7 SCL)")),
-                Tr(Td("Microcontroller"), Td("ESP32-C6-DevKitC-1-N8, RISC-V, running Game of Life firmware")),
-                Tr(Td("Focus scene"), Td("Blue OLED pixels on black + starburst calibration card behind")),
-            ),
-
-            # ---- Model ----
-            H2("SharpnessNet Architecture"),
-            P("A 3-layer CNN with global average pooling. Predicts a sharpness score in [0, 1] from a 32x64 grayscale crop."),
-            Div(
-                "Input: 1x32x64 (grayscale)\n"
-                "  │\n"
-                "  ├─ Conv2d(1→8, 3x3, pad=1) + ReLU + MaxPool2d(2)\n"
-                "  │    └─ output: 8x16x32\n"
-                "  ├─ Conv2d(8→16, 3x3, pad=1) + ReLU + MaxPool2d(2)\n"
-                "  │    └─ output: 16x8x16\n"
-                "  ├─ Conv2d(16→16, 3x3, pad=1) + ReLU\n"
-                "  │    └─ output: 16x8x16\n"
-                "  ├─ GlobalAvgPool (mean over H,W)\n"
-                "  │    └─ output: 16\n"
-                "  └─ Linear(16→1) + Sigmoid\n"
-                "       └─ output: 1 (sharpness score)",
-                cls="arch-box",
-            ),
-            Table(
-                Tr(Th("Layer"), Th("Params"), Th("Output Shape")),
-                Tr(Td("Conv2d(1, 8, 3)"), Td("80", cls="mono"), Td("B x 8 x 16 x 32")),
-                Tr(Td("Conv2d(8, 16, 3)"), Td("1,168", cls="mono"), Td("B x 16 x 8 x 16")),
-                Tr(Td("Conv2d(16, 16, 3)"), Td("2,320", cls="mono"), Td("B x 16 x 8 x 16")),
-                Tr(Td("GlobalAvgPool"), Td("0", cls="mono"), Td("B x 16")),
-                Tr(Td("Linear(16, 1)"), Td("17", cls="mono"), Td("B x 1")),
-                Tr(Td(Strong("Total")), Td(Strong("3,585", cls="mono")), Td("")),
-            ),
-
-            # ---- Training ----
-            H2("Training"),
-            H3("Synthetic Data Generation"),
-            P("2,000 samples generated on-the-fly from random Game of Life simulations — no real camera images needed."),
-            Table(
-                Tr(Th("Step"), Th("Details")),
-                Tr(Td("1. Random GoL"), Td("64x128 grid, density 5–40%, 0–20 evolution steps")),
-                Tr(Td("2. Resize"), Td("128x64 → 64x32, nearest-neighbor interpolation")),
-                Tr(Td("3. Blur"), Td("Gaussian blur, sigma ~ Uniform(0.0, 4.0)")),
-                Tr(Td("4. Noise"), Td("Additive Gaussian, sigma = 0.02")),
-                Tr(Td("5. Label"), Td(Code("1.0 / (1.0 + sigma²)"), " — sharpness in [0, 1]")),
-            ),
-
-            H3("Hyperparameters"),
-            Table(
-                Tr(Th("Parameter"), Th("Value")),
-                Tr(Td("Optimizer"), Td("Adam")),
-                Tr(Td("Learning rate"), Td(Code("1e-3"))),
-                Tr(Td("Batch size"), Td("128")),
-                Tr(Td("Training steps"), Td("200")),
-                Tr(Td("Loss function"), Td("MSE (mean squared error)")),
-                Tr(Td("JIT"), Td("TinyJit (tinygrad kernel fusion)")),
-                Tr(Td("Training time"), Td("~30s on Raspberry Pi 5 CPU")),
-                Tr(Td("Data generation"), Td("~5s for 2,000 samples")),
-            ),
-
-            H3("Training Results"),
-            Pre(Code(
-                "step   0/200: loss=0.1379\n"
-                "step  20/200: loss=0.0859\n"
-                "step  40/200: loss=0.0565\n"
-                "step  60/200: loss=0.0204\n"
-                "step  80/200: loss=0.0108\n"
-                "step 100/200: loss=0.0112\n"
-                "step 120/200: loss=0.0096\n"
-                "step 140/200: loss=0.0121\n"
-                "step 160/200: loss=0.0115\n"
-                "step 180/200: loss=0.0093\n"
-                "step 199/200: loss=0.0149"
-            )),
-
-            H3("Model File"),
-            Table(
-                Tr(Th("Property"), Th("Value")),
-                Tr(Td("Format"), Td("safetensors")),
-                Tr(Td("Size"), Td(model_size, cls="mono")),
-                Tr(Td("Last trained"), Td(model_date)),
-                Tr(Td("Path"), Td(Code("camera/autofocus_model.safetensors"))),
-            ),
-
-            # ---- Scoring ----
-            H2("Sharpness Scoring"),
-            H3("OLED Detection"),
-            P("Classical CV pipeline finds the blue OLED region in the camera frame:"),
-            Table(
-                Tr(Th("Step"), Th("Details")),
-                Tr(Td("Color space"), Td("BGR → HSV")),
-                Tr(Td("Threshold"), Td("H: 90–130, S: 50–255, V: 30–255 (blue glow)")),
-                Tr(Td("Morphology"), Td("Dilate with 7x7 rect kernel, 2 iterations")),
-                Tr(Td("Contour"), Td("Largest contour, area > 500px, aspect ratio 1.3–3.0")),
-                Tr(Td("Fallback"), Td("Center 40% crop if OLED not detected")),
-            ),
-            H3("Hybrid Score"),
-            P("Combines two complementary sharpness measures:"),
-            Div("score = 0.7 * laplacian_norm + 0.3 * cnn_score", cls="formula"),
-            Table(
-                Tr(Th("Component"), Th("Weight"), Th("Method")),
-                Tr(Td("Laplacian variance"), Td("70%"), Td(Code("cv2.Laplacian(crop, CV_64F).var() / 500"))),
-                Tr(Td("CNN prediction"), Td("30%"), Td(Code("SharpnessNet(crop).sigmoid()"))),
-            ),
-            P("The Laplacian detects high-frequency edges (sharp = lots of edges). "
-              "The CNN provides a learned prior from synthetic GoL frames, regularizing "
-              "the score when the scene has low contrast or unusual content."),
-
-            # ---- Algorithm ----
-            H2("Autofocus Algorithm"),
-            P("Three-phase coarse-to-fine search with 300ms settle time between focus changes:"),
-            Table(
-                Tr(Th("Phase"), Th("Positions"), Th("Captures"), Th("Time")),
-                Tr(Td("1. Coarse"), Td(Code("[0, 10, 20, 30, 45, 60, 80]")), Td("7"), Td("~7s")),
-                Tr(Td("2. Fine"), Td(Code("best ± 10, step 5")), Td("~5"), Td("~5s")),
-                Tr(Td("3. Verify"), Td("winner"), Td("1"), Td("~1s")),
-                Tr(Td(Strong("Total")), Td(""), Td(Strong("~13")), Td(Strong("~13s"))),
-            ),
-
             # ---- Reproduce ----
             H2("Reproduce"),
-            H3("Requirements"),
-            Table(
-                Tr(Th("Dependency"), Th("Version"), Th("Purpose")),
-                Tr(Td("Python"), Td("3.11+"), Td("Runtime")),
-                Tr(Td("tinygrad"), Td("0.11"), Td("CNN training & inference")),
-                Tr(Td("OpenCV"), Td("4.12"), Td("Image capture, Laplacian, HSV detection")),
-                Tr(Td("NumPy"), Td("1.26+"), Td("Synthetic data generation")),
-                Tr(Td("v4l2-ctl"), Td("—"), Td("Camera focus control (v4l-utils package)")),
-            ),
-            H3("Commands"),
             Pre(Code(
                 "# Install dependencies\n"
                 "pip install tinygrad opencv-python numpy\n"
@@ -1610,24 +1664,22 @@ def autofocus_page():
                 "# Train the model (~35s on RPi5)\n"
                 "python camera/autofocus.py train\n"
                 "\n"
-                "# Run autofocus (~13s)\n"
+                "# Run autofocus\n"
                 "python camera/autofocus.py focus\n"
                 "\n"
-                "# Full diagnostic sweep (all 51 focus levels, ~3min)\n"
+                "# Full diagnostic sweep (all 51 focus levels)\n"
                 "python camera/autofocus.py sweep"
             )),
             H3("Adapting to Your Setup"),
             Ul(
                 Li(Strong("Different camera:"), " Change ", Code("CAM_DEV"), " and ", Code("CAM_W/CAM_H/CAM_FPS"), " in autofocus.py"),
                 Li(Strong("Different display:"), " Adjust HSV thresholds in ", Code("find_oled()"), " for your display's color"),
-                Li(Strong("Different scene:"), " The Laplacian component (70% weight) works with any high-frequency content; "
+                Li(Strong("Different scene:"), " The Laplacian component works with any high-frequency content; "
                    "retrain the CNN on synthetic frames matching your scene"),
-                Li(Strong("Wider focus range:"), " Expand ", Code("COARSE_POSITIONS"), " and increase settle time for long-travel lenses"),
             ),
 
             # ---- Source ----
             H2("Source"),
-            P("Single file implementation: ", Code("camera/autofocus.py"), " (~280 lines)"),
             Pre(Code(
                 "camera/\n"
                 "├── autofocus.py                  # training + autofocus logic\n"
