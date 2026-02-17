@@ -170,6 +170,7 @@ _af_stage = 0                          # 0=idle, 1=Scramble, 2=Detect, 3=Coarse,
 _af_settle_s = 0.1                     # settle time between focus moves (seconds)
 _af_offset = 0                         # focus offset applied after sweep (compensates scoring bias)
 _af_batch_count = 1                    # how many randomize+autofocus runs to do in sequence
+_af_fft_sigma = 1.5                    # FFT angular prominence threshold (in std devs)
 _NORM_SIZE = (64, 32)                  # fixed crop size (w, h) for scale invariance
 _LAPLACIAN_DIVISOR = 25000.0           # tuned for 64x32 CLAHE-normalized OLED crop (bumped to avoid saturation at 1.0)
 _EDGE_MARGIN_PX = 2                    # bbox within this of frame edge = clipped
@@ -428,6 +429,7 @@ def index():
     settle_ms = int(_af_settle_s * 1000)
     offset = _af_offset
     batch = _af_batch_count
+    fft_sigma_10x = int(_af_fft_sigma * 10)
     return (
         Title("ESP Camera"),
         Style(CSS),
@@ -458,6 +460,7 @@ def index():
                             ("Settle Time", "af_settle", 100, 1000, 50, settle_ms),
                             ("Focus Offset", "af_offset", -20, 20, 1, offset),
                             ("Batch Runs", "af_batch", 1, 30, 1, batch),
+                            ("FFT σ (×10)", "af_fft_sigma", 5, 30, 1, fft_sigma_10x),
                         ]),
                         ctrl_group("Image", IMAGE_CTRLS),
                         ctrl_group("Exposure", EXPOSURE_CTRLS),
@@ -509,6 +512,13 @@ async def ctrl_af_offset(value: int):
 async def ctrl_af_batch(value: int):
     global _af_batch_count
     _af_batch_count = max(1, min(30, value))
+    return Response(status_code=204)
+
+
+@rt("/ctrl/af_fft_sigma")
+async def ctrl_af_fft_sigma(value: int):
+    global _af_fft_sigma
+    _af_fft_sigma = max(5, min(30, value)) / 10.0
     return Response(status_code=204)
 
 
@@ -743,8 +753,8 @@ def _detect_grid_rotation(frame: np.ndarray, cx: int, cy: int) -> float | None:
     mean_val = np.mean(angular_smooth)
     std_val = np.std(angular_smooth)
 
-    # Prominence check: peak must be ≥ 1.5 sigma above mean
-    if std_val <= 0 or (peak_val - mean_val) < 1.5 * std_val:
+    # Prominence check: peak must be ≥ _af_fft_sigma std devs above mean
+    if std_val <= 0 or (peak_val - mean_val) < _af_fft_sigma * std_val:
         return None
 
     # Convert bin index to angle (bin centers)
