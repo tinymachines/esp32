@@ -194,7 +194,7 @@ h2 { color: #0a0; font-size: 1rem; margin: 16px 0 8px; border-bottom: 1px solid 
 .layout { max-width: 1100px; margin: 0 auto; }
 .stream-panel img { width: 100%; border: 2px solid #333; border-radius: 4px; }
 .drawer { max-height: 0; overflow: hidden; transition: max-height 0.3s ease; }
-.drawer.open { max-height: 600px; overflow-y: auto; }
+.drawer.open { max-height: 800px; overflow-y: auto; }
 .drawer-grid {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
     gap: 0 24px; padding: 12px 0;
@@ -336,7 +336,19 @@ def ctrl_group(title, ctrls):
     )
 
 
-def action_buttons():
+def _drawer_toggle(label, drawer_id):
+    """Reusable toggle button for a collapsible drawer."""
+    return Button(
+        f"{label} \u25b8", cls="btn", style="margin-top:8px;",
+        onclick=f"var d=document.getElementById('{drawer_id}');"
+                f"d.classList.toggle('open');"
+                f"this.textContent=d.classList.contains('open')"
+                f"?'{label} \\u25be':'{label} \\u25b8';",
+    )
+
+
+def main_buttons():
+    """Presets + autofocus buttons — always visible above the stream."""
     return Div(
         Div(
             *[
@@ -349,23 +361,6 @@ def action_buttons():
                 )
                 for key, p in PRESETS.items()
             ],
-            cls="btn-row",
-        ),
-        Div(
-            Button(
-                "Save Snapshot",
-                hx_post="/snapshot",
-                hx_swap="innerHTML",
-                hx_target="#status",
-                cls="btn",
-            ),
-            Button(
-                "Randomize",
-                hx_post="/randomize",
-                hx_swap="innerHTML",
-                hx_target="#status",
-                cls="btn btn-warn",
-            ),
             Button(
                 "Autofocus",
                 hx_post="/autofocus-only",
@@ -385,6 +380,33 @@ def action_buttons():
         Div(id="status", cls="status"),
     )
 
+
+def actions_drawer():
+    """Save/Randomize actions hidden in a collapsible drawer."""
+    return Div(
+        _drawer_toggle("Actions", "actions-drawer"),
+        Div(
+            Div(
+                Button(
+                    "Save Snapshot",
+                    hx_post="/snapshot",
+                    hx_swap="innerHTML",
+                    hx_target="#status",
+                    cls="btn",
+                ),
+                Button(
+                    "Randomize",
+                    hx_post="/randomize",
+                    hx_swap="innerHTML",
+                    hx_target="#status",
+                    cls="btn btn-warn",
+                ),
+                cls="btn-row", style="padding:8px 0;",
+            ),
+            id="actions-drawer", cls="drawer",
+        ),
+    )
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -398,27 +420,33 @@ def index():
         H1("ESP Camera Calibration"),
         nav_bar("camera"),
         Div(
+            main_buttons(),
             Div(
                 Img(src="/stream", alt="Live camera stream"),
                 Div(id="af-progress", cls="af-progress"),
                 cls="stream-panel",
             ),
-            action_buttons(),
-            _af_panel_current(),
-            Button("Controls \u25b8", id="drawer-toggle", cls="btn",
-                   onclick="document.getElementById('drawer').classList.toggle('open');"
-                           "this.textContent=this.textContent==='Controls \\u25b8'?'Controls \\u25be':'Controls \\u25b8';",
-                   style="margin-top:12px;"),
+            actions_drawer(),
             Div(
+                _drawer_toggle("Output", "output-drawer"),
                 Div(
-                    ctrl_group("Position", POSITION_CTRLS),
-                    ctrl_group("Focus", FOCUS_CTRLS),
-                    ctrl_group("Autofocus", [("Settle Time", "af_settle", 100, 1000, 50, settle_ms)]),
-                    ctrl_group("Image", IMAGE_CTRLS),
-                    ctrl_group("Exposure", EXPOSURE_CTRLS),
-                    cls="drawer-grid",
+                    _af_panel_current(),
+                    id="output-drawer", cls="drawer",
                 ),
-                id="drawer", cls="drawer",
+            ),
+            Div(
+                _drawer_toggle("Controls", "drawer"),
+                Div(
+                    Div(
+                        ctrl_group("Position", POSITION_CTRLS),
+                        ctrl_group("Focus", FOCUS_CTRLS),
+                        ctrl_group("Autofocus", [("Settle Time", "af_settle", 100, 1000, 50, settle_ms)]),
+                        ctrl_group("Image", IMAGE_CTRLS),
+                        ctrl_group("Exposure", EXPOSURE_CTRLS),
+                        cls="drawer-grid",
+                    ),
+                    id="drawer", cls="drawer",
+                ),
             ),
             cls="layout",
         ),
@@ -767,10 +795,11 @@ async def randomize_autofocus():
     values = _randomize_controls()
     # Start background autofocus (will restore zoom and sweep focus)
     threading.Thread(target=_run_autofocus, args=(values,), daemon=True).start()
-    # Lock UI + kick off progress polling under the stream image
+    # Lock UI + open output drawer + kick off progress polling
     progress_js = (
         "document.body.classList.add('af-locked');" +
         _slider_js(values) +
+        "var od=document.getElementById('output-drawer');if(od)od.classList.add('open');"
         "var p=document.getElementById('af-progress');"
         "if(p){p.setAttribute('hx-get','/af-progress');"
         "p.setAttribute('hx-trigger','load delay:300ms');"
@@ -795,6 +824,7 @@ async def autofocus_only():
     threading.Thread(target=_run_autofocus, args=({"mode": "autofocus_only"},), daemon=True).start()
     progress_js = (
         "document.body.classList.add('af-locked');"
+        "var od=document.getElementById('output-drawer');if(od)od.classList.add('open');"
         "var p=document.getElementById('af-progress');"
         "if(p){p.setAttribute('hx-get','/af-progress');"
         "p.setAttribute('hx-trigger','load delay:300ms');"
