@@ -6,6 +6,7 @@ Visit: http://localhost:3000
 """
 
 import base64
+import json
 import random
 import re
 import shutil
@@ -165,6 +166,7 @@ _af_running = False
 _af_final_focus: int | None = None
 _af_progress = ""                      # e.g. "Coarse 3/9"
 _af_stage = 0                          # 0=idle, 1=Scramble, 2=Detect, 3=Coarse, 4=Fine, 5=Focus
+_af_settle_s = 0.4                     # settle time between focus moves (seconds)
 
 # ---------------------------------------------------------------------------
 # FastHTML app
@@ -189,11 +191,14 @@ body {
 }
 h1 { color: #0f0; font-size: 1.3rem; margin-bottom: 16px; }
 h2 { color: #0a0; font-size: 1rem; margin: 16px 0 8px; border-bottom: 1px solid #333; padding-bottom: 4px; }
-.layout { display: grid; grid-template-columns: 1fr 360px; gap: 24px; max-width: 1400px; margin: 0 auto; }
+.layout { max-width: 1100px; margin: 0 auto; }
 .stream-panel img { width: 100%; border: 2px solid #333; border-radius: 4px; }
-.controls { max-height: 90vh; overflow-y: auto; padding-right: 8px; }
-.controls::-webkit-scrollbar { width: 6px; }
-.controls::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+.drawer { max-height: 0; overflow: hidden; transition: max-height 0.3s ease; }
+.drawer.open { max-height: 600px; overflow-y: auto; }
+.drawer-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 0 24px; padding: 12px 0;
+}
 .ctrl-row {
     display: grid; grid-template-columns: 110px 1fr 50px; gap: 8px;
     align-items: center; margin-bottom: 6px;
@@ -214,7 +219,7 @@ nav a { color: #0f0; margin-right: 16px; text-decoration: none; font-size: 0.9re
 nav a:hover { text-decoration: underline; }
 nav a.active { border-bottom: 2px solid #0f0; }
 @media (max-width: 900px) {
-    .layout { grid-template-columns: 1fr; }
+    .drawer-grid { grid-template-columns: 1fr; }
 }
 .af-page { max-width: 900px; margin: 0 auto; }
 .af-page h2 { color: #0a0; font-size: 1.1rem; margin: 28px 0 10px; border-bottom: 1px solid #333; padding-bottom: 4px; }
@@ -331,9 +336,8 @@ def ctrl_group(title, ctrls):
     )
 
 
-def preset_buttons():
+def action_buttons():
     return Div(
-        H2("Presets"),
         Div(
             *[
                 Button(
@@ -345,6 +349,9 @@ def preset_buttons():
                 )
                 for key, p in PRESETS.items()
             ],
+            cls="btn-row",
+        ),
+        Div(
             Button(
                 "Save Snapshot",
                 hx_post="/snapshot",
@@ -377,6 +384,7 @@ def preset_buttons():
 
 @rt("/")
 def index():
+    settle_ms = int(_af_settle_s * 1000)
     return (
         Title("ESP Camera"),
         Style(CSS),
@@ -388,17 +396,25 @@ def index():
                 Div(id="af-progress", cls="af-progress"),
                 cls="stream-panel",
             ),
+            action_buttons(),
+            _af_panel_current(),
+            Button("Controls \u25b8", id="drawer-toggle", cls="btn",
+                   onclick="document.getElementById('drawer').classList.toggle('open');"
+                           "this.textContent=this.textContent==='Controls \\u25b8'?'Controls \\u25be':'Controls \\u25b8';",
+                   style="margin-top:12px;"),
             Div(
-                preset_buttons(),
-                ctrl_group("Position", POSITION_CTRLS),
-                ctrl_group("Focus", FOCUS_CTRLS),
-                ctrl_group("Image", IMAGE_CTRLS),
-                ctrl_group("Exposure", EXPOSURE_CTRLS),
-                cls="controls",
+                Div(
+                    ctrl_group("Position", POSITION_CTRLS),
+                    ctrl_group("Focus", FOCUS_CTRLS),
+                    ctrl_group("Autofocus", [("Settle Time", "af_settle", 100, 1000, 50, settle_ms)]),
+                    ctrl_group("Image", IMAGE_CTRLS),
+                    ctrl_group("Exposure", EXPOSURE_CTRLS),
+                    cls="drawer-grid",
+                ),
+                id="drawer", cls="drawer",
             ),
             cls="layout",
         ),
-        _af_panel_current(),
     )
 
 
@@ -420,6 +436,13 @@ async def stream():
         generate(),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@rt("/ctrl/af_settle")
+async def ctrl_af_settle(value: int):
+    global _af_settle_s
+    _af_settle_s = max(100, min(1000, value)) / 1000.0
+    return Response(status_code=204)
 
 
 @rt("/ctrl/{name}")
@@ -569,7 +592,7 @@ def _af_panel_current():
         )
     return Div(id="af-panel", cls="af-panel")
 
-def _run_autofocus():
+def _run_autofocus(initial_values: dict):
     """Background thread: coarse-to-fine autofocus with Laplacian scoring."""
     global _af_running, _af_log, _af_final_focus, _af_progress, _af_stage
     _af_running = True
@@ -609,7 +632,7 @@ def _run_autofocus():
         progress("Detecting OLED...")
         log("Detecting OLED region at focus=30...")
         cam.set_ctrl("focus_absolute", 30)
-        time.sleep(0.4)
+        time.sleep(_af_settle_s)
         frame = _capture_frame()
         bbox = _find_oled_rect(frame)
         if bbox:
@@ -628,7 +651,7 @@ def _run_autofocus():
         for i, pos in enumerate(coarse):
             progress(f"Coarse {i+1}/{len(coarse)}")
             cam.set_ctrl("focus_absolute", pos)
-            time.sleep(0.4)
+            time.sleep(_af_settle_s)
             score = _score_position(bbox, n=3)
             results.append((pos, score))
             bar = chr(9608) * int(score * 30)
@@ -648,7 +671,7 @@ def _run_autofocus():
         for i, pos in enumerate(fine_positions):
             progress(f"Fine {i+1}/{len(fine_positions)}")
             cam.set_ctrl("focus_absolute", pos)
-            time.sleep(0.4)
+            time.sleep(_af_settle_s)
             score = _score_position(bbox, n=3)
             results.append((pos, score))
             bar = chr(9608) * int(score * 30)
@@ -668,7 +691,7 @@ def _run_autofocus():
         for i, pos in enumerate(micro_positions):
             progress(f"Micro {i+1}/{len(micro_positions)}")
             cam.set_ctrl("focus_absolute", pos)
-            time.sleep(0.4)
+            time.sleep(_af_settle_s)
             score = _score_position(bbox, n=5)
             results.append((pos, score))
             bar = chr(9608) * int(score * 30)
@@ -692,6 +715,20 @@ def _run_autofocus():
         cv2.rectangle(post_annotated, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
         _save_af_photo(post_annotated, af_ts, "post")
         _save_af_photo(post_frame[by:by+bh, bx:bx+bw], af_ts, "oled")
+
+        # Save metadata JSON
+        meta = {
+            "timestamp": af_ts,
+            "settle_ms": int(_af_settle_s * 1000),
+            "initial": initial_values,
+            "final": {
+                "focus_absolute": best_pos,
+                "score": round(final_score, 4),
+                **restore,
+            },
+            "oled_bbox": {"x": bx, "y": by, "w": bw, "h": bh},
+        }
+        (PHOTOS_DIR / f"{af_ts}_meta.json").write_text(json.dumps(meta, indent=2))
 
         log("")
         log(f"Done! Best focus = {best_pos}  (score = {final_score:.4f})", "af-best")
@@ -722,7 +759,7 @@ async def randomize_autofocus():
     # Randomize controls now so we can return slider JS immediately
     values = _randomize_controls()
     # Start background autofocus (will restore zoom and sweep focus)
-    threading.Thread(target=_run_autofocus, daemon=True).start()
+    threading.Thread(target=_run_autofocus, args=(values,), daemon=True).start()
     # Lock UI + kick off progress polling under the stream image
     progress_js = (
         "document.body.classList.add('af-locked');" +
@@ -834,10 +871,27 @@ def photos_page():
         post_name = f"{ts_str}_post.jpg"
         oled_name = f"{ts_str}_oled.jpg"
         pre_name = pre_path.name
+        # Load metadata if available
+        meta_path = PHOTOS_DIR / f"{ts_str}_meta.json"
+        meta = None
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+            except Exception:
+                pass
+        meta_info = ""
+        if meta:
+            f_val = meta.get("final", {}).get("focus_absolute", "?")
+            f_score = meta.get("final", {}).get("score", "?")
+            meta_info = f"focus={f_val}  score={f_score}"
         cards.append(
             Div(
                 Div(f"#{ts_str}", style="color:#0a0;font-size:0.85rem;font-weight:bold;"),
-                Div(date_str, style="color:#666;font-size:0.75rem;margin-bottom:8px;"),
+                Div(
+                    Span(date_str, style="color:#666;font-size:0.75rem;"),
+                    Span(f"  {meta_info}", style="color:#0f0;font-size:0.75rem;") if meta_info else "",
+                    style="margin-bottom:8px;",
+                ),
                 Div(
                     Div(
                         Img(src=f"/photos/{pre_name}", style="width:100%;border:1px solid #333;border-radius:2px;"),
@@ -850,7 +904,7 @@ def photos_page():
                         style="text-align:center;",
                     ),
                     Div(
-                        Img(src=f"/photos/{oled_name}", style="width:100%;border:1px solid #333;border-radius:2px;image-rendering:pixelated;"),
+                        Img(src=f"/photos/{oled_name}", style="width:100%;border:2px solid #0f0;border-radius:2px;image-rendering:pixelated;"),
                         Div("OLED crop", style="color:#888;font-size:0.7rem;margin-top:4px;"),
                         style="text-align:center;",
                     ),
@@ -870,7 +924,14 @@ def photos_page():
 
 @rt("/photos/{filename}")
 async def photos_file(filename: str):
-    if not re.fullmatch(r"[a-zA-Z0-9_.]+", filename) or not filename.endswith(".jpg"):
+    if not re.fullmatch(r"[a-zA-Z0-9_.]+", filename):
+        return Response("Not found", status_code=404)
+    if filename.endswith(".json"):
+        path = PHOTOS_DIR / filename
+        if not path.exists():
+            return Response("Not found", status_code=404)
+        return FileResponse(path, media_type="application/json")
+    if not filename.endswith(".jpg"):
         return Response("Not found", status_code=404)
     path = PHOTOS_DIR / filename
     if not path.exists():
