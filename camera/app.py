@@ -160,6 +160,7 @@ cam = CameraManager()
 _af_log: list[tuple[str, str]] = []   # (text, css_class)
 _af_running = False
 _af_final_focus: int | None = None
+_af_progress = ""                      # e.g. "Coarse 3/9"
 
 # ---------------------------------------------------------------------------
 # FastHTML app
@@ -269,6 +270,8 @@ nav a.active { border-bottom: 2px solid #0f0; }
 .af-best { color: #0f0; font-weight: bold; font-size: 0.88rem; padding: 4px 0; }
 .btn-hero { color: #0ff; border-color: #0ff; }
 .btn-hero:hover { background: #002a2a; }
+.af-progress { color: #0ff; font-size: 0.8rem; min-height: 1.4em; margin-top: 6px; font-family: 'JetBrains Mono', monospace; }
+.af-progress:empty { display: none; }
 """
 
 # ---------------------------------------------------------------------------
@@ -359,6 +362,7 @@ def index():
         Div(
             Div(
                 Img(src="/stream", alt="Live camera stream"),
+                Div(id="af-progress", cls="af-progress"),
                 cls="stream-panel",
             ),
             Div(
@@ -521,15 +525,21 @@ def _af_panel_current():
 
 def _run_autofocus():
     """Background thread: coarse-to-fine autofocus with Laplacian scoring."""
-    global _af_running, _af_log, _af_final_focus
+    global _af_running, _af_log, _af_final_focus, _af_progress
     _af_running = True
     _af_log = []
     _af_final_focus = None
+    _af_progress = ""
 
     def log(msg, cls="af-info"):
         _af_log.append((msg, cls))
 
+    def progress(text):
+        global _af_progress
+        _af_progress = text
+
     try:
+        progress("Restoring preset...")
         time.sleep(0.5)
         # Restore everything except focus — leave focus as the variable
         log("Restoring camera preset (keeping random focus)...")
@@ -545,6 +555,7 @@ def _run_autofocus():
             cam.set_ctrl(name, val)
         time.sleep(1.2)  # settle for zoom motor + image pipeline
 
+        progress("Detecting OLED...")
         log("Detecting OLED region at focus=30...")
         cam.set_ctrl("focus_absolute", 30)
         time.sleep(0.4)
@@ -562,7 +573,8 @@ def _run_autofocus():
         log("--- Coarse sweep (3-frame median) ---", "af-header")
         coarse = list(range(0, 90, 10))  # [0, 10, 20, 30, 40, 50, 60, 70, 80]
         results = []
-        for pos in coarse:
+        for i, pos in enumerate(coarse):
+            progress(f"Coarse {i+1}/{len(coarse)}")
             cam.set_ctrl("focus_absolute", pos)
             time.sleep(0.4)
             score = _score_position(bbox, n=3)
@@ -580,7 +592,8 @@ def _run_autofocus():
         fine_hi = min(255, best_pos + 15)
         tested = {r[0] for r in results}
         fine_positions = [p for p in range(fine_lo, fine_hi + 1, 5) if p not in tested]
-        for pos in fine_positions:
+        for i, pos in enumerate(fine_positions):
+            progress(f"Fine {i+1}/{len(fine_positions)}")
             cam.set_ctrl("focus_absolute", pos)
             time.sleep(0.4)
             score = _score_position(bbox, n=3)
@@ -598,7 +611,8 @@ def _run_autofocus():
         micro_hi = min(255, best_pos + 5)
         tested = {r[0] for r in results}
         micro_positions = [p for p in range(micro_lo, micro_hi + 1, 2) if p not in tested]
-        for pos in micro_positions:
+        for i, pos in enumerate(micro_positions):
+            progress(f"Micro {i+1}/{len(micro_positions)}")
             cam.set_ctrl("focus_absolute", pos)
             time.sleep(0.4)
             score = _score_position(bbox, n=5)
@@ -609,6 +623,7 @@ def _run_autofocus():
         best_pos, best_score = max(results, key=lambda r: r[1])
 
         # Verify — 5-frame median
+        progress("Verifying...")
         log("")
         log("--- Verify (5-frame median) ---", "af-header")
         cam.set_ctrl("focus_absolute", best_pos)
@@ -619,9 +634,11 @@ def _run_autofocus():
         log("")
         log(f"Done! Best focus = {best_pos}  (score = {final_score:.4f})", "af-best")
         _af_final_focus = best_pos
+        progress("")
 
     except Exception as e:
         log(f"Error: {e}", "af-error")
+        progress("")
     finally:
         _af_running = False
 
@@ -643,14 +660,36 @@ async def randomize_autofocus():
     values = _randomize_controls()
     # Start background autofocus (will restore zoom and sweep focus)
     threading.Thread(target=_run_autofocus, daemon=True).start()
+    # Kick off progress polling under the stream image
+    progress_js = (
+        _slider_js(values) +
+        "var p=document.getElementById('af-progress');"
+        "if(p){p.setAttribute('hx-get','/af-progress');"
+        "p.setAttribute('hx-trigger','load delay:300ms');"
+        "p.setAttribute('hx-swap','outerHTML');"
+        "htmx.process(p);}"
+    )
     return Div(
         Div("Randomized! Starting autofocus...", cls="af-info"),
-        Script(_slider_js(values)),
+        Script(progress_js),
         hx_get="/autofocus-status",
         hx_trigger="load delay:500ms",
         hx_swap="outerHTML",
         id="af-panel", cls="af-panel",
     )
+
+
+@rt("/af-progress")
+async def af_progress():
+    if _af_running and _af_progress:
+        return Div(
+            _af_progress,
+            hx_get="/af-progress",
+            hx_trigger="load delay:300ms",
+            hx_swap="outerHTML",
+            id="af-progress", cls="af-progress",
+        )
+    return Div(id="af-progress", cls="af-progress")
 
 
 @rt("/autofocus-status")
