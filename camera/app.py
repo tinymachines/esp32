@@ -167,7 +167,7 @@ _af_lock = threading.Lock()
 _af_final_focus: int | None = None
 _af_progress = ""                      # e.g. "Coarse 3/9"
 _af_stage = 0                          # 0=idle, 1=Scramble, 2=Detect, 3=Coarse, 4=Fine, 5=Ultra, 6=Focus
-_af_settle_s = 0.5                     # settle time between focus moves (seconds)
+_af_settle_s = 0.1                     # settle time between focus moves (seconds)
 _af_offset = 0                         # focus offset applied after sweep (compensates scoring bias)
 _NORM_SIZE = (64, 32)                  # fixed crop size (w, h) for scale invariance
 _LAPLACIAN_DIVISOR = 25000.0           # tuned for 64x32 CLAHE-normalized OLED crop (bumped to avoid saturation at 1.0)
