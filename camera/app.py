@@ -170,7 +170,7 @@ _af_stage = 0                          # 0=idle, 1=Scramble, 2=Detect, 3=Coarse,
 _af_settle_s = 0.1                     # settle time between focus moves (seconds)
 _af_offset = 0                         # focus offset applied after sweep (compensates scoring bias)
 _af_batch_count = 1                    # how many randomize+autofocus runs to do in sequence
-_af_fft_sigma = 1.5                    # FFT angular prominence threshold (in std devs)
+_af_fft_sigma = 1.0                    # FFT angular prominence threshold (in std devs)
 _NORM_SIZE = (64, 32)                  # fixed crop size (w, h) for scale invariance
 _LAPLACIAN_DIVISOR = 25000.0           # tuned for 64x32 CLAHE-normalized OLED crop (bumped to avoid saturation at 1.0)
 _EDGE_MARGIN_PX = 2                    # bbox within this of frame edge = clipped
