@@ -169,6 +169,7 @@ _af_progress = ""                      # e.g. "Coarse 3/9"
 _af_stage = 0                          # 0=idle, 1=Scramble, 2=Detect, 3=Coarse, 4=Fine, 5=Ultra, 6=Focus
 _af_settle_s = 0.1                     # settle time between focus moves (seconds)
 _af_offset = 0                         # focus offset applied after sweep (compensates scoring bias)
+_af_batch_count = 1                    # how many randomize+autofocus runs to do in sequence
 _NORM_SIZE = (64, 32)                  # fixed crop size (w, h) for scale invariance
 _LAPLACIAN_DIVISOR = 25000.0           # tuned for 64x32 CLAHE-normalized OLED crop (bumped to avoid saturation at 1.0)
 _EDGE_MARGIN_PX = 2                    # bbox within this of frame edge = clipped
@@ -426,6 +427,7 @@ def actions_drawer():
 def index():
     settle_ms = int(_af_settle_s * 1000)
     offset = _af_offset
+    batch = _af_batch_count
     return (
         Title("ESP Camera"),
         Style(CSS),
@@ -455,6 +457,7 @@ def index():
                         ctrl_group("Autofocus", [
                             ("Settle Time", "af_settle", 100, 1000, 50, settle_ms),
                             ("Focus Offset", "af_offset", -20, 20, 1, offset),
+                            ("Batch Runs", "af_batch", 1, 30, 1, batch),
                         ]),
                         ctrl_group("Image", IMAGE_CTRLS),
                         ctrl_group("Exposure", EXPOSURE_CTRLS),
@@ -499,6 +502,13 @@ async def ctrl_af_settle(value: int):
 async def ctrl_af_offset(value: int):
     global _af_offset
     _af_offset = max(-20, min(20, value))
+    return Response(status_code=204)
+
+
+@rt("/ctrl/af_batch")
+async def ctrl_af_batch(value: int):
+    global _af_batch_count
+    _af_batch_count = max(1, min(30, value))
     return Response(status_code=204)
 
 
@@ -856,22 +866,34 @@ def _af_panel_current():
         )
     return Div(id="af-panel", cls="af-panel")
 
-def _run_autofocus(initial_values: dict):
+def _run_autofocus(initial_values: dict, batch: int = 1):
     """Background thread: coarse-to-fine autofocus with Laplacian scoring."""
     global _af_running, _af_log, _af_final_focus, _af_progress, _af_stage
     _af_log = []
     _af_final_focus = None
     _af_progress = ""
-    _af_stage = 1  # Scramble
+    _af_stage = 0
+
+    run_prefix = ""
 
     def log(msg, cls="af-info"):
         _af_log.append((msg, cls))
 
     def progress(text):
         global _af_progress
-        _af_progress = text
+        _af_progress = f"{run_prefix}{text}" if text else ""
 
     try:
+      for run_i in range(batch):
+        if batch > 1:
+            run_prefix = f"[{run_i + 1}/{batch}] "
+            if run_i > 0:
+                log("")
+                log(f"{'━' * 50}", "af-dim")
+                initial_values = _randomize_controls()
+            log(f"Run {run_i + 1} of {batch}", "af-header")
+
+        _af_stage = 1  # Scramble
         progress("Scrambling...")
         time.sleep(0.5)
         af_ts = int(time.time())
@@ -1117,9 +1139,11 @@ async def randomize_autofocus():
         _af_running = True
     # Randomize controls now so we can return slider JS immediately
     values = _randomize_controls()
+    batch = _af_batch_count
     # Start background autofocus (will restore zoom and sweep focus)
-    threading.Thread(target=_run_autofocus, args=(values,), daemon=True).start()
+    threading.Thread(target=_run_autofocus, args=(values, batch), daemon=True).start()
     # Lock UI + open output drawer + kick off progress polling
+    batch_label = f"batch {batch}" if batch > 1 else ""
     progress_js = (
         "document.body.classList.add('af-locked');" +
         _slider_js(values) +
@@ -1130,8 +1154,9 @@ async def randomize_autofocus():
         "p.setAttribute('hx-swap','outerHTML');"
         "htmx.process(p);}"
     )
+    msg = f"Randomized! Starting autofocus ({batch} runs)..." if batch > 1 else "Randomized! Starting autofocus..."
     return Div(
-        Div("Randomized! Starting autofocus...", cls="af-info"),
+        Div(msg, cls="af-info"),
         Script(progress_js),
         hx_get="/autofocus-status",
         hx_trigger="load delay:500ms",
