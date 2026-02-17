@@ -161,6 +161,7 @@ _af_log: list[tuple[str, str]] = []   # (text, css_class)
 _af_running = False
 _af_final_focus: int | None = None
 _af_progress = ""                      # e.g. "Coarse 3/9"
+_af_stage = 0                          # 0=idle, 1=Scramble, 2=Detect, 3=Coarse, 4=Fine, 5=Focus
 
 # ---------------------------------------------------------------------------
 # FastHTML app
@@ -272,6 +273,25 @@ nav a.active { border-bottom: 2px solid #0f0; }
 .btn-hero:hover { background: #002a2a; }
 .af-progress { color: #0ff; font-size: 0.8rem; min-height: 1.4em; margin-top: 6px; font-family: 'JetBrains Mono', monospace; }
 .af-progress:empty { display: none; }
+.stage-bar { display: flex; align-items: center; margin: 10px 0 4px; gap: 0; }
+.stage-node { display: flex; flex-direction: column; align-items: center; min-width: 56px; }
+.stage-dot {
+    width: 14px; height: 14px; border-radius: 50%;
+    border: 2px solid #333; background: #222;
+    transition: all 0.3s;
+}
+.stage-dot.done { background: #0a0; border-color: #0f0; box-shadow: 0 0 6px #0f04; }
+.stage-dot.active { background: #0aa; border-color: #0ff; box-shadow: 0 0 8px #0ff6; animation: pulse-dot 1s infinite; }
+.stage-label { font-size: 0.65rem; color: #555; margin-top: 3px; }
+.stage-label.done { color: #0a0; }
+.stage-label.active { color: #0ff; }
+.stage-line { flex: 1; height: 2px; background: #333; min-width: 16px; margin-top: -16px; }
+.stage-line.done { background: #0a0; }
+@keyframes pulse-dot { 0%,100% { box-shadow: 0 0 4px #0ff4; } 50% { box-shadow: 0 0 12px #0ff8; } }
+body.af-locked .btn,
+body.af-locked nav a,
+body.af-locked input[type=range] { pointer-events: none; opacity: 0.3; transition: opacity 0.3s; }
+body.af-locked .btn-hero { pointer-events: none; opacity: 0.5; }
 """
 
 # ---------------------------------------------------------------------------
@@ -504,6 +524,24 @@ def _laplacian_score(frame: np.ndarray, bbox) -> float:
     gray = cv2.cvtColor(frame[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
     return min(cv2.Laplacian(gray, cv2.CV_64F).var() / 2000.0, 1.0)
 
+_STAGE_NAMES = ["Scramble", "Detect", "Coarse", "Fine", "Focus"]
+
+def _stage_html(current: int):
+    """Render a 5-stage pipeline graphic. current: 1–5 (active), 0=idle."""
+    nodes = []
+    for i, name in enumerate(_STAGE_NAMES, 1):
+        if i < current:
+            dot_cls, lbl_cls = "stage-dot done", "stage-label done"
+        elif i == current:
+            dot_cls, lbl_cls = "stage-dot active", "stage-label active"
+        else:
+            dot_cls, lbl_cls = "stage-dot", "stage-label"
+        nodes.append(Div(Div(cls=dot_cls), Span(name, cls=lbl_cls), cls="stage-node"))
+        if i < len(_STAGE_NAMES):
+            line_cls = "stage-line done" if i < current else "stage-line"
+            nodes.append(Div(cls=line_cls))
+    return Div(*nodes, cls="stage-bar")
+
 def _af_panel_current():
     """Return the appropriate af-panel for current state."""
     if _af_running:
@@ -525,11 +563,12 @@ def _af_panel_current():
 
 def _run_autofocus():
     """Background thread: coarse-to-fine autofocus with Laplacian scoring."""
-    global _af_running, _af_log, _af_final_focus, _af_progress
+    global _af_running, _af_log, _af_final_focus, _af_progress, _af_stage
     _af_running = True
     _af_log = []
     _af_final_focus = None
     _af_progress = ""
+    _af_stage = 1  # Scramble
 
     def log(msg, cls="af-info"):
         _af_log.append((msg, cls))
@@ -539,8 +578,9 @@ def _run_autofocus():
         _af_progress = text
 
     try:
-        progress("Restoring preset...")
+        progress("Scrambling...")
         time.sleep(0.5)
+        _af_stage = 2  # Detect
         # Restore everything except focus — leave focus as the variable
         log("Restoring camera preset (keeping random focus)...")
         restore = {
@@ -569,6 +609,7 @@ def _run_autofocus():
             bbox = _center_crop_rect(frame)
 
         # Coarse sweep — every 10 steps, 3-frame median at each
+        _af_stage = 3  # Coarse
         log("")
         log("--- Coarse sweep (3-frame median) ---", "af-header")
         coarse = list(range(0, 90, 10))  # [0, 10, 20, 30, 40, 50, 60, 70, 80]
@@ -586,6 +627,7 @@ def _run_autofocus():
         log(f"  * best: focus={best_pos} (score={best_score:.4f})", "af-good")
 
         # Fine sweep — ±15 around best, step 5, 3-frame median
+        _af_stage = 4  # Fine
         log("")
         log("--- Fine sweep (3-frame median) ---", "af-header")
         fine_lo = max(0, best_pos - 15)
@@ -605,6 +647,7 @@ def _run_autofocus():
         log(f"  * best: focus={best_pos} (score={best_score:.4f})", "af-good")
 
         # Micro sweep — ±5 around best, step 2, 5-frame median
+        _af_stage = 5  # Focus
         log("")
         log("--- Micro sweep (5-frame median) ---", "af-header")
         micro_lo = max(0, best_pos - 5)
@@ -640,6 +683,7 @@ def _run_autofocus():
         log(f"Error: {e}", "af-error")
         progress("")
     finally:
+        _af_stage = 0
         _af_running = False
 
 # ---------------------------------------------------------------------------
@@ -660,8 +704,9 @@ async def randomize_autofocus():
     values = _randomize_controls()
     # Start background autofocus (will restore zoom and sweep focus)
     threading.Thread(target=_run_autofocus, daemon=True).start()
-    # Kick off progress polling under the stream image
+    # Lock UI + kick off progress polling under the stream image
     progress_js = (
+        "document.body.classList.add('af-locked');" +
         _slider_js(values) +
         "var p=document.getElementById('af-progress');"
         "if(p){p.setAttribute('hx-get','/af-progress');"
@@ -681,9 +726,12 @@ async def randomize_autofocus():
 
 @rt("/af-progress")
 async def af_progress():
-    if _af_running and _af_progress:
+    if _af_running:
+        children = [_stage_html(_af_stage)]
+        if _af_progress:
+            children.append(Div(_af_progress, style="color:#0ff;font-size:0.8rem;margin-top:2px;"))
         return Div(
-            _af_progress,
+            *children,
             hx_get="/af-progress",
             hx_trigger="load delay:300ms",
             hx_swap="outerHTML",
@@ -707,7 +755,7 @@ async def autofocus_status():
             id="af-panel", cls="af-panel",
         )
 
-    # Done — sync sliders for all restored settings + final focus
+    # Done — unlock UI + sync sliders for all restored settings + final focus
     final_values = {
         "zoom_absolute": 150, "pan_absolute": 0, "tilt_absolute": 0,
         "focus_automatic_continuous": 0, "sharpness": 180,
@@ -718,7 +766,8 @@ async def autofocus_status():
     }
     if _af_final_focus is not None:
         final_values["focus_absolute"] = _af_final_focus
-    elements.append(Script(_slider_js(final_values)))
+    unlock_js = "document.body.classList.remove('af-locked');" + _slider_js(final_values)
+    elements.append(Script(unlock_js))
     return Div(*elements, id="af-panel", cls="af-panel")
 
 
