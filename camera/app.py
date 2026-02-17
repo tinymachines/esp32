@@ -367,6 +367,13 @@ def action_buttons():
                 cls="btn btn-warn",
             ),
             Button(
+                "Autofocus",
+                hx_post="/autofocus-only",
+                hx_target="#af-panel",
+                hx_swap="outerHTML",
+                cls="btn btn-hero",
+            ),
+            Button(
                 "Randomize + Autofocus",
                 hx_post="/randomize-autofocus",
                 hx_target="#af-panel",
@@ -780,6 +787,30 @@ async def randomize_autofocus():
     )
 
 
+@rt("/autofocus-only")
+async def autofocus_only():
+    if _af_running:
+        return Div(Div("Autofocus already running...", cls="af-warn"), id="af-panel", cls="af-panel")
+    # Start autofocus with current settings (no randomize)
+    threading.Thread(target=_run_autofocus, args=({"mode": "autofocus_only"},), daemon=True).start()
+    progress_js = (
+        "document.body.classList.add('af-locked');"
+        "var p=document.getElementById('af-progress');"
+        "if(p){p.setAttribute('hx-get','/af-progress');"
+        "p.setAttribute('hx-trigger','load delay:300ms');"
+        "p.setAttribute('hx-swap','outerHTML');"
+        "htmx.process(p);}"
+    )
+    return Div(
+        Div("Starting autofocus (keeping current settings)...", cls="af-info"),
+        Script(progress_js),
+        hx_get="/autofocus-status",
+        hx_trigger="load delay:500ms",
+        hx_swap="outerHTML",
+        id="af-panel", cls="af-panel",
+    )
+
+
 @rt("/af-progress")
 async def af_progress():
     if _af_running:
@@ -884,6 +915,7 @@ def photos_page():
             f_val = meta.get("final", {}).get("focus_absolute", "?")
             f_score = meta.get("final", {}).get("score", "?")
             meta_info = f"focus={f_val}  score={f_score}"
+        drawer_id = f"card-{ts_str}"
         cards.append(
             Div(
                 Div(f"#{ts_str}", style="color:#0a0;font-size:0.85rem;font-weight:bold;"),
@@ -910,6 +942,23 @@ def photos_page():
                     ),
                     style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;",
                 ),
+                Button("\u25b8", cls="btn",
+                       style="font-size:0.75rem;padding:3px 10px;margin-top:8px;",
+                       onclick=f"var d=document.getElementById('{drawer_id}');"
+                               f"d.classList.toggle('open');"
+                               f"this.textContent=d.classList.contains('open')?'\\u25be':'\\u25b8';"),
+                Div(
+                    Div(
+                        A("Wide View", href=f"/photos/{post_name}", target="_blank", cls="btn",
+                          style="text-decoration:none;display:inline-block;"),
+                        A("OLED", href=f"/photos/{oled_name}", target="_blank", cls="btn",
+                          style="text-decoration:none;display:inline-block;border-color:#0f0;"),
+                        A("Save", href=f"/photos/{post_name}", download=post_name, cls="btn",
+                          style="text-decoration:none;display:inline-block;"),
+                        cls="btn-row",
+                    ),
+                    id=drawer_id, cls="drawer",
+                ),
                 style="background:#0a0a0a;border:1px solid #333;border-radius:4px;padding:12px 16px;margin-bottom:16px;",
             )
         )
@@ -918,8 +967,35 @@ def photos_page():
         Style(CSS),
         H1("Photos // Autofocus Runs"),
         nav_bar("photos"),
-        Div(*cards, style="max-width:1100px;margin:0 auto;"),
+        Div(
+            Div(
+                Button("Archive All", hx_post="/photos/archive", hx_swap="innerHTML",
+                       hx_target="#photos-status", cls="btn btn-warn",
+                       hx_confirm="Move all photos to archive?"),
+                Div(id="photos-status", cls="status"),
+                cls="btn-row", style="margin-bottom:16px;",
+            ),
+            *cards,
+            style="max-width:1100px;margin:0 auto;",
+        ),
     )
+
+
+ARCHIVE_DIR = PHOTOS_DIR / "archive"
+
+
+@rt("/photos/archive")
+async def photos_archive():
+    files = list(PHOTOS_DIR.glob("*_pre.jpg")) + list(PHOTOS_DIR.glob("*_post.jpg")) + \
+            list(PHOTOS_DIR.glob("*_oled.jpg")) + list(PHOTOS_DIR.glob("*_meta.json"))
+    if not files:
+        return "Nothing to archive"
+    ts = int(time.time())
+    dest = ARCHIVE_DIR / str(ts)
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        shutil.move(str(f), str(dest / f.name))
+    return f"Archived {len(files)} files to archive/{ts}"
 
 
 @rt("/photos/{filename}")
