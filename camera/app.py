@@ -172,10 +172,10 @@ _af_offset = 0                         # focus offset applied after sweep (compe
 _NORM_SIZE = (64, 32)                  # fixed crop size (w, h) for scale invariance
 _LAPLACIAN_DIVISOR = 25000.0           # tuned for 64x32 CLAHE-normalized OLED crop (bumped to avoid saturation at 1.0)
 _EDGE_MARGIN_PX = 2                    # bbox within this of frame edge = clipped
-_CROP_COARSE = 20                      # progressive crop sizes per sweep phase
-_CROP_FINE = 30
-_CROP_MICRO = 40
-_CROP_ULTRA = 40
+_CROP_COARSE = 80                      # progressive crop sizes per sweep phase
+_CROP_FINE = 100
+_CROP_MICRO = 120
+_CROP_ULTRA = 120
 _BAIL_DOMINANCE = 1.5                  # best must be ≥1.5x second-best to bail early
 
 # ---------------------------------------------------------------------------
