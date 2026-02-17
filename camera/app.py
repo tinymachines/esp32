@@ -554,9 +554,12 @@ def _slider_js(values: dict[str, int]) -> str:
         )
     return "".join(parts)
 
-def _save_af_photo(frame: np.ndarray, ts: int, suffix: str) -> Path:
-    path = PHOTOS_DIR / f"{ts}_{suffix}.jpg"
-    cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+def _save_af_photo(frame: np.ndarray, ts: int, suffix: str, fmt: str = "jpg") -> Path:
+    path = PHOTOS_DIR / f"{ts}_{suffix}.{fmt}"
+    if fmt == "png":
+        cv2.imwrite(str(path), frame)
+    else:
+        cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
     return path
 
 def _capture_frame() -> np.ndarray:
@@ -664,42 +667,144 @@ def _check_bbox_clipping(frame: np.ndarray, bbox) -> bool:
             or (y + h) >= (fh - _EDGE_MARGIN_PX))
 
 def _detect_grid_rotation(frame: np.ndarray, cx: int, cy: int) -> float | None:
-    """Detect OLED pixel grid angle from a 60x60 crop around (cx, cy).
+    """Detect OLED pixel grid angle via angular energy integration of the FFT.
 
-    Returns median angle in degrees if ≥10 pixel-shaped contours found, else None.
+    The periodic pixel grid concentrates FFT energy along specific orientations.
+    Instead of hunting for a single point peak (which fails when the grid signal
+    is a broad ridge rather than a sharp spike), we integrate magnitude in an
+    annular band and find the dominant angle.
+
+    Returns angle in degrees ([-45, 45]) or None if no clear directional signal.
     """
     fh, fw = frame.shape[:2]
-    half = 30
-    x0 = max(0, min(cx - half, fw - 2 * half))
-    y0 = max(0, min(cy - half, fh - 2 * half))
-    crop = frame[y0:y0 + 2 * half, x0:x0 + 2 * half]
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    angles = []
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < 4 or area > 100:
-            continue
-        if len(c) < 5:
-            continue
-        rect = cv2.minAreaRect(c)
-        w, h = rect[1]
-        if min(w, h) < 0.1:
-            continue
-        aspect = max(w, h) / min(w, h)
-        if aspect > 2.5:
-            continue
-        angle = rect[2]
-        # Normalize to [-45, 45]
-        if angle > 45:
-            angle -= 90
-        elif angle < -45:
-            angle += 90
-        angles.append(angle)
-    if len(angles) >= 10:
-        return float(np.median(angles))
-    return None
+    half = 100
+    size = 2 * half
+    x0 = max(0, min(cx - half, fw - size))
+    y0 = max(0, min(cy - half, fh - size))
+    crop = frame[y0:y0 + size, x0:x0 + size]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    # Hanning window reduces spectral leakage
+    window = np.outer(np.hanning(size), np.hanning(size)).astype(np.float32)
+    gray = gray * window
+
+    # 2D FFT → magnitude spectrum
+    fft = np.fft.fft2(gray)
+    fft_shift = np.fft.fftshift(fft)
+    magnitude = np.log1p(np.abs(fft_shift))
+
+    # Build coordinate grids relative to center
+    cy_f, cx_f = size // 2, size // 2
+    yy, xx = np.mgrid[:size, :size]
+    dy = (yy - cy_f).astype(np.float32)
+    dx = (xx - cx_f).astype(np.float32)
+    radius = np.sqrt(dy ** 2 + dx ** 2)
+
+    # Annular band: skip DC skirt (r < 15) and noisy high freqs (r > 80)
+    band = (radius >= 15) & (radius <= 80)
+    if not np.any(band):
+        return None
+
+    # Compute angle for each pixel (0–180°, folded by conjugate symmetry)
+    angles = np.degrees(np.arctan2(dy, dx)) % 180.0
+
+    # Bin magnitude by angle (1° bins, 180 bins total)
+    n_bins = 180
+    bin_edges = np.linspace(0, 180, n_bins + 1)
+    bin_idx = np.digitize(angles[band], bin_edges) - 1
+    bin_idx = np.clip(bin_idx, 0, n_bins - 1)
+    mag_vals = magnitude[band]
+
+    angular_energy = np.zeros(n_bins)
+    np.add.at(angular_energy, bin_idx, mag_vals)
+    # Normalize by bin count to avoid bias from geometry
+    bin_counts = np.zeros(n_bins)
+    np.add.at(bin_counts, bin_idx, 1)
+    bin_counts[bin_counts == 0] = 1
+    angular_energy /= bin_counts
+
+    # Smooth with a small kernel to reduce noise
+    kernel = np.ones(5) / 5
+    angular_smooth = np.convolve(angular_energy, kernel, mode='same')
+
+    # Find dominant angle
+    peak_bin = np.argmax(angular_smooth)
+    peak_val = angular_smooth[peak_bin]
+    mean_val = np.mean(angular_smooth)
+    std_val = np.std(angular_smooth)
+
+    # Prominence check: peak must be ≥ 1.5 sigma above mean
+    if std_val <= 0 or (peak_val - mean_val) < 1.5 * std_val:
+        return None
+
+    # Convert bin index to angle (bin centers)
+    peak_angle = (bin_edges[peak_bin] + bin_edges[peak_bin + 1]) / 2.0
+
+    # FFT energy direction is perpendicular to grid lines → rotate 90°
+    angle = peak_angle + 90.0
+
+    # Normalize to [-45, 45]
+    angle = angle % 180.0
+    if angle > 135:
+        angle -= 180
+    elif angle > 45:
+        angle -= 90
+
+    return float(angle)
+
+def _fft_magnitude_image(frame: np.ndarray, cx: int, cy: int,
+                         annotate: bool = True) -> np.ndarray:
+    """Return a colorized BGR image of the FFT magnitude spectrum.
+
+    Green-on-black color ramp. If annotate=True, draws the annular band boundaries
+    and the detected dominant angle line in cyan.
+    """
+    fh, fw = frame.shape[:2]
+    half = 100
+    size = 2 * half
+    x0 = max(0, min(cx - half, fw - size))
+    y0 = max(0, min(cy - half, fh - size))
+    crop = frame[y0:y0 + size, x0:x0 + size]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    win = np.outer(np.hanning(size), np.hanning(size)).astype(np.float32)
+    gray = gray * win
+
+    fft = np.fft.fft2(gray)
+    fft_shift = np.fft.fftshift(fft)
+    magnitude = np.log1p(np.abs(fft_shift))
+
+    # Normalize to [0, 255]
+    mag_max = magnitude.max()
+    if mag_max > 0:
+        mag_norm = (magnitude / mag_max * 255).astype(np.uint8)
+    else:
+        mag_norm = np.zeros((size, size), dtype=np.uint8)
+
+    # Green-on-black colormap
+    bgr = np.zeros((size, size, 3), dtype=np.uint8)
+    bgr[:, :, 1] = mag_norm  # green channel
+
+    if annotate:
+        c = size // 2
+        # Draw annular band boundaries (dim cyan circles)
+        cv2.circle(bgr, (c, c), 15, (128, 128, 0), 1, cv2.LINE_AA)
+        cv2.circle(bgr, (c, c), 80, (128, 128, 0), 1, cv2.LINE_AA)
+
+        # Detect grid angle and draw the dominant direction line
+        grid_angle = _detect_grid_rotation(frame, cx, cy)
+        if grid_angle is not None:
+            # grid_angle is the grid direction; FFT energy is perpendicular
+            fft_angle = grid_angle - 90.0
+            rad = np.radians(fft_angle)
+            length = 90
+            dx = int(length * np.cos(rad))
+            dy = int(length * np.sin(rad))
+            cv2.line(bgr, (c - dx, c - dy), (c + dx, c + dy),
+                     (255, 255, 0), 1, cv2.LINE_AA)
+
+    return bgr
+
 
 def _deskew_frame(frame: np.ndarray, angle_deg: float) -> np.ndarray:
     """Rotate frame by -angle_deg around its center to deskew."""
@@ -915,7 +1020,11 @@ def _run_autofocus(initial_values: dict):
         if grid_angle is not None:
             log(f"  Grid angle: {grid_angle:.1f} degrees", "af-good")
         else:
-            log("  Grid angle: not detected (insufficient pixel samples)", "af-warn")
+            log("  Grid angle: not detected (no dominant FFT peak)", "af-warn")
+
+        # Save FFT spectrum image
+        fft_img = _fft_magnitude_image(frame, focus_cx, focus_cy, annotate=True)
+        _save_af_photo(fft_img, af_ts, "fft", fmt="png")
 
         # --- Re-detect OLED (deskewed if angle found) ---
         log("")
@@ -965,6 +1074,7 @@ def _run_autofocus(initial_values: dict):
                 "focus_absolute": best_pos,
                 "score": round(final_score, 4),
                 "grid_angle_deg": round(grid_angle, 2) if grid_angle is not None else None,
+                "grid_detection_method": "fft",
                 **restore,
             },
             "focus_center": {"x": focus_cx, "y": focus_cy},
@@ -1148,6 +1258,8 @@ def photos_page():
         date_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
         post_name = f"{ts_str}_post.jpg"
         oled_name = f"{ts_str}_oled.jpg"
+        fft_name = f"{ts_str}_fft.png"
+        has_fft = (PHOTOS_DIR / fft_name).exists()
         pre_name = pre_path.name
         # Load metadata if available
         meta_path = PHOTOS_DIR / f"{ts_str}_meta.json"
@@ -1187,7 +1299,12 @@ def photos_page():
                         Div("OLED crop", style="color:#888;font-size:0.7rem;margin-top:4px;"),
                         style="text-align:center;",
                     ),
-                    style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;",
+                    *([Div(
+                        Img(src=f"/photos/{fft_name}", style="width:100%;border:2px solid #0a0;border-radius:2px;image-rendering:pixelated;"),
+                        Div("FFT spectrum", style="color:#888;font-size:0.7rem;margin-top:4px;"),
+                        style="text-align:center;",
+                    )] if has_fft else []),
+                    style=f"display:grid;grid-template-columns:{'1fr 1fr 1fr 1fr' if has_fft else '1fr 1fr 1fr'};gap:10px;",
                 ),
                 Button("\u25b8", cls="btn",
                        style="font-size:0.75rem;padding:3px 10px;margin-top:8px;",
@@ -1234,7 +1351,8 @@ ARCHIVE_DIR = PHOTOS_DIR / "archive"
 @rt("/photos/archive")
 async def photos_archive():
     files = list(PHOTOS_DIR.glob("*_pre.jpg")) + list(PHOTOS_DIR.glob("*_post.jpg")) + \
-            list(PHOTOS_DIR.glob("*_oled.jpg")) + list(PHOTOS_DIR.glob("*_meta.json"))
+            list(PHOTOS_DIR.glob("*_oled.jpg")) + list(PHOTOS_DIR.glob("*_fft.png")) + \
+            list(PHOTOS_DIR.glob("*_meta.json"))
     if not files:
         return "Nothing to archive"
     ts = int(time.time())
@@ -1254,16 +1372,126 @@ async def photos_file(filename: str):
         if not path.exists():
             return Response("Not found", status_code=404)
         return FileResponse(path, media_type="application/json")
-    if not filename.endswith(".jpg"):
+    if filename.endswith(".jpg"):
+        media = "image/jpeg"
+    elif filename.endswith(".png"):
+        media = "image/png"
+    else:
         return Response("Not found", status_code=404)
     path = PHOTOS_DIR / filename
     if not path.exists():
         return Response("Not found", status_code=404)
     return FileResponse(
         path,
-        media_type="image/jpeg",
+        media_type=media,
         headers={"Cache-Control": "public, max-age=86400"},
     )
+
+# ---------------------------------------------------------------------------
+# FFT demo helpers
+# ---------------------------------------------------------------------------
+
+def _make_rotated_grid(angle_deg: float, size: int = 200, pitch: int = 6, seed: int = 42) -> np.ndarray:
+    """Synthetic OLED pixel grid at a known rotation angle. Returns BGR image."""
+    rng = np.random.default_rng(seed)
+    # Start with larger canvas to avoid border artifacts after rotation
+    pad = size
+    big = pad * 2 + size
+    canvas = np.zeros((big, big), dtype=np.uint8)
+
+    # Draw filled rectangles simulating OLED pixels (some on, some off)
+    pw, ph = pitch - 1, pitch - 1  # pixel size (leave 1px gap)
+    for y in range(0, big, pitch):
+        for x in range(0, big, pitch):
+            if rng.random() < 0.45:  # ~45% pixels lit
+                canvas[y:y+ph, x:x+pw] = 180 + rng.integers(0, 75)
+
+    # Rotate
+    center = (big // 2, big // 2)
+    M = cv2.getRotationMatrix2D(center, -angle_deg, 1.0)
+    rotated = cv2.warpAffine(canvas, M, (big, big), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    # Crop center
+    x0 = (big - size) // 2
+    y0 = (big - size) // 2
+    crop = rotated[y0:y0+size, x0:x0+size]
+
+    # Convert to blue-on-black BGR (mimicking OLED appearance)
+    bgr = np.zeros((size, size, 3), dtype=np.uint8)
+    bgr[:, :, 0] = crop  # blue channel
+    bgr[:, :, 1] = (crop * 0.3).astype(np.uint8)  # faint green
+    return bgr
+
+
+def _fft_spectrum_data_uri(img: np.ndarray, scale: int = 1,
+                           show_angle: bool = False) -> str:
+    """FFT magnitude spectrum as green-on-black PNG data URI.
+
+    img: BGR or grayscale image.
+    If show_angle=True, draws the annular band and detected angle line in cyan.
+    """
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    else:
+        gray = img.astype(np.float32)
+    h, w = gray.shape
+
+    win = np.outer(np.hanning(h), np.hanning(w)).astype(np.float32)
+    gray = gray * win
+
+    fft = np.fft.fft2(gray)
+    fft_shift = np.fft.fftshift(fft)
+    magnitude = np.log1p(np.abs(fft_shift))
+
+    mag_max = magnitude.max()
+    if mag_max > 0:
+        mag_norm = (magnitude / mag_max * 255).astype(np.uint8)
+    else:
+        mag_norm = np.zeros_like(gray, dtype=np.uint8)
+
+    # Green-on-black
+    bgr = np.zeros((h, w, 3), dtype=np.uint8)
+    bgr[:, :, 1] = mag_norm
+
+    c = min(h, w) // 2
+
+    if show_angle:
+        # Draw annular band boundaries
+        cv2.circle(bgr, (w // 2, h // 2), 15, (128, 128, 0), 1, cv2.LINE_AA)
+        cv2.circle(bgr, (w // 2, h // 2), 80, (128, 128, 0), 1, cv2.LINE_AA)
+
+        # Use _detect_grid_rotation to find the angle
+        # For synthetic images, we pass a fake frame with the image at center
+        grid_angle = _detect_grid_rotation(
+            cv2.copyMakeBorder(img if len(img.shape) == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR),
+                               0, 0, 0, 0, cv2.BORDER_CONSTANT),
+            w // 2, h // 2,
+        )
+        if grid_angle is not None:
+            fft_angle = grid_angle - 90.0
+            rad = np.radians(fft_angle)
+            length = min(c, 90)
+            dx = int(length * np.cos(rad))
+            dy = int(length * np.sin(rad))
+            cv2.line(bgr, (w // 2 - dx, h // 2 - dy), (w // 2 + dx, h // 2 + dy),
+                     (255, 255, 0), 1, cv2.LINE_AA)
+
+    if scale > 1:
+        bgr = cv2.resize(bgr, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
+
+    _, buf = cv2.imencode(".png", bgr)
+    return f"data:image/png;base64,{base64.b64encode(buf).decode()}"
+
+
+def _bgr_to_data_uri(img: np.ndarray, scale: int = 1) -> str:
+    """Convert a BGR image to a PNG data URI."""
+    if scale > 1:
+        h, w = img.shape[:2]
+        img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
+    _, buf = cv2.imencode(".png", img)
+    return f"data:image/png;base64,{base64.b64encode(buf).decode()}"
+
 
 # ---------------------------------------------------------------------------
 # Pipeline page helpers
@@ -1446,6 +1674,23 @@ def docs_page():
 
     loss_svg = _loss_curve_svg()
 
+    # --- FFT demo: synthetic rotated grid at 15° ---
+    fft_demo_angle = 15.0
+    fft_demo_grid = _make_rotated_grid(fft_demo_angle, size=200, pitch=6, seed=42)
+    fft_demo_grid_uri = _bgr_to_data_uri(fft_demo_grid, scale=1)
+
+    # Plain FFT spectrum (no annotations)
+    fft_demo_plain_uri = _fft_spectrum_data_uri(fft_demo_grid, scale=1)
+
+    # Annotated FFT spectrum (with annular band + angle line)
+    fft_demo_annotated_uri = _fft_spectrum_data_uri(
+        fft_demo_grid, scale=1, show_angle=True,
+    )
+
+    # Deskewed result
+    fft_demo_deskewed = _deskew_frame(fft_demo_grid, fft_demo_angle)
+    fft_demo_deskewed_uri = _bgr_to_data_uri(fft_demo_deskewed, scale=1)
+
     mermaid_js = (
         "import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';\n"
         "mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {"
@@ -1523,15 +1768,57 @@ def docs_page():
               "Ultra always runs — it's only ~5 positions. This can cut sweep time significantly "
               "when the focus peak is unambiguous."),
 
-            H3("Grid Rotation Detection"),
-            P("At sharp focus, individual OLED pixels appear as crisp rectangles. "
-              "Their orientation reveals the physical grid angle (~15–20° in the current setup):"),
+            H3("Grid Rotation Detection (FFT)"),
+            P("The OLED pixel grid creates a periodic pattern that produces sharp peaks "
+              "in the 2D FFT magnitude spectrum. The angle from the DC center to the "
+              "dominant peak equals the grid rotation angle. This works at any zoom where "
+              "the grid is visible — even when individual pixels are too small for contour "
+              "detection (< 3 camera pixels wide)."),
+
+            Div(
+                Div(
+                    Img(src=fft_demo_grid_uri),
+                    Div(f"Input grid ({fft_demo_angle:.0f}°)", cls="cap"),
+                    cls="img-cell",
+                ),
+                Div(
+                    Img(src=fft_demo_plain_uri),
+                    Div("FFT magnitude", cls="cap"),
+                    cls="img-cell",
+                ),
+                Div(
+                    Img(src=fft_demo_annotated_uri),
+                    Div(Span("Peak detection", cls="hi"), cls="cap"),
+                    cls="img-cell",
+                ),
+                Div(
+                    Img(src=fft_demo_deskewed_uri),
+                    Div("Deskewed result", cls="cap"),
+                    cls="img-cell",
+                ),
+                cls="img-grid cols-4",
+            ),
+
+            P("Algorithm:"),
             Ul(
-                Li("Take a 60x60 crop around the focus center"),
-                Li("Convert to grayscale, Otsu threshold to binary"),
-                Li("Find contours, filter to pixel-sized blobs (area 4–100px², aspect < 2.5)"),
-                Li(Code("cv2.minAreaRect"), " for each contour — collect angles"),
-                Li("Normalize angles to [-45°, 45°], return median if ≥ 10 samples"),
+                Li("Take a 200x200 crop around the focus center (more periods = sharper peaks)"),
+                Li("Grayscale, multiply by 2D Hanning window (reduces spectral leakage)"),
+                Li(Code("np.fft.fft2"), " → ", Code("fftshift"), " → ", Code("log1p(abs())"),
+                   " = magnitude spectrum"),
+                Li("Mask out DC region (radius < 5px from center)"),
+                Li("Find dominant peak in upper half (conjugate symmetry)"),
+                Li("Prominence check: peak must be ≥ 3× median (rejects flat/noisy spectra)"),
+                Li(Code("atan2(dy, dx)"), " → angle in degrees, rotated 90° (peak ⊥ grid), "
+                   "normalized to [-45°, 45°]"),
+            ),
+            P("Advantages over contour-based detection:"),
+            Ul(
+                Li(Strong("Zoom-invariant:"), " Works at any magnification where the grid is visible — "
+                   "no minimum pixel size required"),
+                Li(Strong("Single-peak aggregation:"), " One dominant peak instead of "
+                   "voting across dozens of noisy contour angles"),
+                Li(Strong("Sub-pixel pitch:"), " Even 2–3 camera pixels per OLED pixel "
+                   "creates a measurable FFT peak"),
             ),
             P("If detected (|angle| > 0.5°), the frame is deskewed via ", Code("cv2.warpAffine"),
               " before OLED re-detection. This produces tighter, axis-aligned bounding boxes "
