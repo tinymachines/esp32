@@ -84,6 +84,19 @@ def random_gol_frame(rng: np.random.Generator, density: float, steps: int) -> np
         grid = gol_step(grid)
     return grid
 
+def _add_pixel_grid(frame: np.ndarray, cell_px: int = 4) -> np.ndarray:
+    """Upscale binary GoL frame and add 1px black grid lines between cells.
+
+    Simulates the visible pixel gaps on a real SSD1306 OLED.
+    Each cell becomes cell_px x cell_px with a 1px black border.
+    """
+    h, w = frame.shape
+    big = cv2.resize(frame.astype(np.float32), (w * cell_px, h * cell_px),
+                     interpolation=cv2.INTER_NEAREST)
+    big[::cell_px, :] = 0  # horizontal lines
+    big[:, ::cell_px] = 0  # vertical lines
+    return big
+
 def generate_dataset(n_samples: int = 2000, seed: int = 42):
     """Generate synthetic GoL frames with varying blur for sharpness training."""
     rng = np.random.default_rng(seed)
@@ -95,9 +108,10 @@ def generate_dataset(n_samples: int = 2000, seed: int = 42):
         steps = rng.integers(0, 21)
         frame = random_gol_frame(rng, density, steps)
 
-        # Resize 128x64 → 64x32 nearest-neighbor
-        small = cv2.resize(frame.astype(np.float32), (64, 32),
-                           interpolation=cv2.INTER_NEAREST)
+        # Render with pixel grid lines, then downscale with area averaging
+        grid_frame = _add_pixel_grid(frame, cell_px=4)
+        small = cv2.resize(grid_frame, (64, 32),
+                           interpolation=cv2.INTER_AREA)
 
         # Apply Gaussian blur (sigma 0–4)
         sigma = rng.uniform(0.0, 4.0)

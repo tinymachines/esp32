@@ -163,10 +163,15 @@ cam = CameraManager()
 
 _af_log: list[tuple[str, str]] = []   # (text, css_class)
 _af_running = False
+_af_lock = threading.Lock()
 _af_final_focus: int | None = None
 _af_progress = ""                      # e.g. "Coarse 3/9"
-_af_stage = 0                          # 0=idle, 1=Scramble, 2=Detect, 3=Coarse, 4=Fine, 5=Focus
-_af_settle_s = 0.4                     # settle time between focus moves (seconds)
+_af_stage = 0                          # 0=idle, 1=Scramble, 2=Detect, 3=Coarse, 4=Fine, 5=Ultra, 6=Focus
+_af_settle_s = 0.5                     # settle time between focus moves (seconds)
+_af_offset = 0                         # focus offset applied after sweep (compensates scoring bias)
+_NORM_SIZE = (64, 32)                  # fixed crop size (w, h) for scale invariance
+_LAPLACIAN_DIVISOR = 25000.0           # tuned for 64x32 CLAHE-normalized OLED crop (bumped to avoid saturation at 1.0)
+_EDGE_MARGIN_PX = 2                    # bbox within this of frame edge = clipped
 
 # ---------------------------------------------------------------------------
 # FastHTML app
@@ -366,6 +371,7 @@ def main_buttons():
                 hx_post="/autofocus-only",
                 hx_target="#af-panel",
                 hx_swap="outerHTML",
+                hx_disabled_elt="this",
                 cls="btn btn-hero",
             ),
             Button(
@@ -373,6 +379,7 @@ def main_buttons():
                 hx_post="/randomize-autofocus",
                 hx_target="#af-panel",
                 hx_swap="outerHTML",
+                hx_disabled_elt="this",
                 cls="btn btn-hero",
             ),
             cls="btn-row",
@@ -414,6 +421,7 @@ def actions_drawer():
 @rt("/")
 def index():
     settle_ms = int(_af_settle_s * 1000)
+    offset = _af_offset
     return (
         Title("ESP Camera"),
         Style(CSS),
@@ -440,7 +448,10 @@ def index():
                     Div(
                         ctrl_group("Position", POSITION_CTRLS),
                         ctrl_group("Focus", FOCUS_CTRLS),
-                        ctrl_group("Autofocus", [("Settle Time", "af_settle", 100, 1000, 50, settle_ms)]),
+                        ctrl_group("Autofocus", [
+                            ("Settle Time", "af_settle", 100, 1000, 50, settle_ms),
+                            ("Focus Offset", "af_offset", -20, 20, 1, offset),
+                        ]),
                         ctrl_group("Image", IMAGE_CTRLS),
                         ctrl_group("Exposure", EXPOSURE_CTRLS),
                         cls="drawer-grid",
@@ -477,6 +488,13 @@ async def stream():
 async def ctrl_af_settle(value: int):
     global _af_settle_s
     _af_settle_s = max(100, min(1000, value)) / 1000.0
+    return Response(status_code=204)
+
+
+@rt("/ctrl/af_offset")
+async def ctrl_af_offset(value: int):
+    global _af_offset
+    _af_offset = max(-20, min(20, value))
     return Response(status_code=204)
 
 
@@ -548,14 +566,20 @@ def _capture_frame() -> np.ndarray:
     return frame
 
 def _score_position(bbox, n=3) -> float:
-    """Score current focus by taking median Laplacian over n frames."""
-    scores = []
+    """Score current focus by averaging n normalized crops, then computing Laplacian once.
+
+    Averaging pixel data before scoring cancels out temporal artifacts
+    (OLED refresh flicker, sensor noise) that can corrupt individual frames.
+    """
+    acc = None
     for _ in range(n):
         frame = _capture_frame()
-        scores.append(_laplacian_score(frame, bbox))
+        crop = _normalize_crop(frame, bbox)
+        acc = crop if acc is None else acc + crop
         time.sleep(0.05)
-    scores.sort()
-    return scores[len(scores) // 2]
+    avg_crop = acc / n
+    lap = cv2.Laplacian((avg_crop * 255).astype(np.uint8), cv2.CV_64F)
+    return min(float(lap.var()) / _LAPLACIAN_DIVISOR, 1.0)
 
 def _find_oled_rect(frame: np.ndarray):
     """Detect OLED via blue HSV threshold. Returns (x,y,w,h) or None."""
@@ -584,16 +608,33 @@ def _center_crop_rect(frame: np.ndarray):
     cw, ch = int(w * 0.4), int(h * 0.4)
     return (w // 2 - cw // 2, h // 2 - ch // 2, cw, ch)
 
-def _laplacian_score(frame: np.ndarray, bbox) -> float:
-    """Laplacian variance sharpness score, normalized to [0, 1]."""
+def _normalize_crop(frame: np.ndarray, bbox) -> np.ndarray:
+    """Extract bbox, resize to fixed size, grayscale, CLAHE normalize."""
     x, y, w, h = bbox
     gray = cv2.cvtColor(frame[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
-    return min(cv2.Laplacian(gray, cv2.CV_64F).var() / 2000.0, 1.0)
+    gray = cv2.resize(gray, _NORM_SIZE, interpolation=cv2.INTER_AREA)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    gray = clahe.apply(gray)
+    return gray.astype(np.float32) / 255.0
 
-_STAGE_NAMES = ["Scramble", "Detect", "Coarse", "Fine", "Focus"]
+def _check_bbox_clipping(frame: np.ndarray, bbox) -> bool:
+    """Return True if bbox is within _EDGE_MARGIN_PX of any frame edge."""
+    fh, fw = frame.shape[:2]
+    x, y, w, h = bbox
+    return (x <= _EDGE_MARGIN_PX or y <= _EDGE_MARGIN_PX
+            or (x + w) >= (fw - _EDGE_MARGIN_PX)
+            or (y + h) >= (fh - _EDGE_MARGIN_PX))
+
+def _laplacian_score(frame: np.ndarray, bbox) -> float:
+    """Laplacian variance sharpness score, normalized to [0, 1]."""
+    crop = _normalize_crop(frame, bbox)
+    lap = cv2.Laplacian((crop * 255).astype(np.uint8), cv2.CV_64F)
+    return min(float(lap.var()) / _LAPLACIAN_DIVISOR, 1.0)
+
+_STAGE_NAMES = ["Scramble", "Detect", "Coarse", "Fine", "Ultra", "Focus"]
 
 def _stage_html(current: int):
-    """Render a 5-stage pipeline graphic. current: 1–5 (active), 0=idle."""
+    """Render a 6-stage pipeline graphic. current: 1–6 (active), 0=idle."""
     nodes = []
     for i, name in enumerate(_STAGE_NAMES, 1):
         if i < current:
@@ -630,7 +671,6 @@ def _af_panel_current():
 def _run_autofocus(initial_values: dict):
     """Background thread: coarse-to-fine autofocus with Laplacian scoring."""
     global _af_running, _af_log, _af_final_focus, _af_progress, _af_stage
-    _af_running = True
     _af_log = []
     _af_final_focus = None
     _af_progress = ""
@@ -673,15 +713,17 @@ def _run_autofocus(initial_values: dict):
         if bbox:
             x, y, w, h = bbox
             log(f"  OLED found: {w}x{h} at ({x},{y})", "af-good")
+            if _check_bbox_clipping(frame, bbox):
+                log(f"  Warning: OLED bbox touches frame edge (partial visibility)", "af-warn")
         else:
             log("  OLED not detected, using center crop", "af-warn")
             bbox = _center_crop_rect(frame)
 
-        # Coarse sweep — every 10 steps, 3-frame median at each
+        # Coarse sweep — every 20 steps across full range, 3-frame avg
         _af_stage = 3  # Coarse
         log("")
-        log("--- Coarse sweep (3-frame median) ---", "af-header")
-        coarse = list(range(0, 90, 10))  # [0, 10, 20, 30, 40, 50, 60, 70, 80]
+        log("--- Coarse sweep (3-frame avg) ---", "af-header")
+        coarse = list(range(0, 256, 20))  # [0, 20, 40, ..., 240]
         results = []
         for i, pos in enumerate(coarse):
             progress(f"Coarse {i+1}/{len(coarse)}")
@@ -695,10 +737,10 @@ def _run_autofocus(initial_values: dict):
         best_pos, best_score = max(results, key=lambda r: r[1])
         log(f"  * best: focus={best_pos} (score={best_score:.4f})", "af-good")
 
-        # Fine sweep — ±15 around best, step 5, 3-frame median
+        # Fine sweep — ±15 around best, step 5, 5-frame avg
         _af_stage = 4  # Fine
         log("")
-        log("--- Fine sweep (3-frame median) ---", "af-header")
+        log("--- Fine sweep (5-frame avg) ---", "af-header")
         fine_lo = max(0, best_pos - 15)
         fine_hi = min(255, best_pos + 15)
         tested = {r[0] for r in results}
@@ -707,7 +749,7 @@ def _run_autofocus(initial_values: dict):
             progress(f"Fine {i+1}/{len(fine_positions)}")
             cam.set_ctrl("focus_absolute", pos)
             time.sleep(_af_settle_s)
-            score = _score_position(bbox, n=3)
+            score = _score_position(bbox, n=5)
             results.append((pos, score))
             bar = chr(9608) * int(score * 30)
             log(f"  focus={pos:3d}  score={score:.4f}  {bar}")
@@ -715,10 +757,9 @@ def _run_autofocus(initial_values: dict):
         best_pos, best_score = max(results, key=lambda r: r[1])
         log(f"  * best: focus={best_pos} (score={best_score:.4f})", "af-good")
 
-        # Micro sweep — ±5 around best, step 2, 5-frame median
-        _af_stage = 5  # Focus
+        # Micro sweep — ±5 around best, step 2, 5-frame avg
         log("")
-        log("--- Micro sweep (5-frame median) ---", "af-header")
+        log("--- Micro sweep (5-frame avg) ---", "af-header")
         micro_lo = max(0, best_pos - 5)
         micro_hi = min(255, best_pos + 5)
         tested = {r[0] for r in results}
@@ -732,12 +773,43 @@ def _run_autofocus(initial_values: dict):
             bar = chr(9608) * int(score * 30)
             log(f"  focus={pos:3d}  score={score:.4f}  {bar}")
 
-        best_pos, best_score = max(results, key=lambda r: r[1])
+        # Pick best from micro range only (prevents overshoot from noisy coarse/fine scores)
+        micro_results = [(p, s) for p, s in results if micro_lo <= p <= micro_hi]
+        best_pos, best_score = max(micro_results, key=lambda r: r[1])
+        log(f"  * best: focus={best_pos} (score={best_score:.4f})", "af-good")
 
-        # Verify — 5-frame median
+        # Ultra sweep — ±2 around micro best, step 1, 5-frame avg
+        _af_stage = 5  # Ultra
+        log("")
+        log("--- Ultra sweep (5-frame avg, step 1) ---", "af-header")
+        ultra_lo = max(0, best_pos - 2)
+        ultra_hi = min(255, best_pos + 2)
+        tested = {r[0] for r in results}
+        ultra_positions = [p for p in range(ultra_lo, ultra_hi + 1) if p not in tested]
+        for i, pos in enumerate(ultra_positions):
+            progress(f"Ultra {i+1}/{len(ultra_positions)}")
+            cam.set_ctrl("focus_absolute", pos)
+            time.sleep(_af_settle_s)
+            score = _score_position(bbox, n=5)
+            results.append((pos, score))
+            bar = chr(9608) * int(score * 30)
+            log(f"  focus={pos:3d}  score={score:.4f}  {bar}")
+
+        # Final best from ultra range only
+        ultra_all = [(p, s) for p, s in results if ultra_lo <= p <= ultra_hi]
+        best_pos, best_score = max(ultra_all, key=lambda r: r[1])
+        log(f"  * best: focus={best_pos} (score={best_score:.4f})", "af-good")
+
+        # Apply focus offset
+        if _af_offset != 0:
+            best_pos = max(0, min(255, best_pos + _af_offset))
+            log(f"  + offset {_af_offset:+d} → focus={best_pos}", "af-info")
+
+        # Verify — 5-frame avg
+        _af_stage = 6  # Focus
         progress("Verifying...")
         log("")
-        log("--- Verify (5-frame median) ---", "af-header")
+        log("--- Verify (5-frame avg) ---", "af-header")
         cam.set_ctrl("focus_absolute", best_pos)
         time.sleep(0.5)
         final_score = _score_position(bbox, n=5)
@@ -789,8 +861,11 @@ async def randomize():
 
 @rt("/randomize-autofocus")
 async def randomize_autofocus():
-    if _af_running:
-        return Div(Div("Autofocus already running...", cls="af-warn"), id="af-panel", cls="af-panel")
+    global _af_running
+    with _af_lock:
+        if _af_running:
+            return Div(Div("Autofocus already running...", cls="af-warn"), id="af-panel", cls="af-panel")
+        _af_running = True
     # Randomize controls now so we can return slider JS immediately
     values = _randomize_controls()
     # Start background autofocus (will restore zoom and sweep focus)
@@ -818,8 +893,11 @@ async def randomize_autofocus():
 
 @rt("/autofocus-only")
 async def autofocus_only():
-    if _af_running:
-        return Div(Div("Autofocus already running...", cls="af-warn"), id="af-panel", cls="af-panel")
+    global _af_running
+    with _af_lock:
+        if _af_running:
+            return Div(Div("Autofocus already running...", cls="af-warn"), id="af-panel", cls="af-panel")
+        _af_running = True
     # Start autofocus with current settings (no randomize)
     threading.Thread(target=_run_autofocus, args=({"mode": "autofocus_only"},), daemon=True).start()
     progress_js = (
@@ -1061,13 +1139,23 @@ def _gol_step(grid):
             neighbors += np.roll(np.roll(grid, dy, axis=0), dx, axis=1)
     return ((neighbors == 3) | ((grid == 1) & (neighbors == 2))).astype(np.uint8)
 
+def _add_pixel_grid(frame: np.ndarray, cell_px: int = 4) -> np.ndarray:
+    """Upscale binary GoL frame and add 1px black grid lines between cells."""
+    h, w = frame.shape
+    big = cv2.resize(frame.astype(np.float32), (w * cell_px, h * cell_px),
+                     interpolation=cv2.INTER_NEAREST)
+    big[::cell_px, :] = 0
+    big[:, ::cell_px] = 0
+    return big
+
 def _make_sample(density, steps, sigma, seed=42):
     """Generate one synthetic GoL sample. Returns (image_float32, label)."""
     rng = np.random.default_rng(seed)
     grid = (rng.random((64, 128)) < density).astype(np.uint8)
     for _ in range(steps):
         grid = _gol_step(grid)
-    small = cv2.resize(grid.astype(np.float32), (64, 32), interpolation=cv2.INTER_NEAREST)
+    grid_frame = _add_pixel_grid(grid, cell_px=4)
+    small = cv2.resize(grid_frame, (64, 32), interpolation=cv2.INTER_AREA)
     if sigma > 0.3:
         ksize = int(np.ceil(sigma * 3)) * 2 + 1
         small = cv2.GaussianBlur(small, (ksize, ksize), sigma)
