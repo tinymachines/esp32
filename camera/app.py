@@ -125,7 +125,9 @@ class CameraManager:
             self.cap = None
 
     def read_jpeg(self, quality: int = 85, scale: float = 1.0) -> bytes | None:
-        with self.lock:
+        if not self.lock.acquire(timeout=5):
+            return None  # lock held too long (camera read hung), skip frame
+        try:
             if not self.cap:
                 return None
             ok, frame = self.cap.read()
@@ -137,6 +139,8 @@ class CameraManager:
                 frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
             _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
             return buf.tobytes()
+        finally:
+            self.lock.release()
 
     def set_ctrl(self, name: str, value: int):
         subprocess.run(
@@ -166,11 +170,14 @@ _af_running = False
 _af_lock = threading.Lock()
 _af_final_focus: int | None = None
 _af_progress = ""                      # e.g. "Coarse 3/9"
-_af_stage = 0                          # 0=idle, 1=Scramble, 2=Detect, 3=Coarse, 4=Fine, 5=Ultra, 6=Focus
+_af_stage = 0                          # 0=idle, 1=Scramble, 2=Detect, 3=Locate, 4=Coarse, 5=Fine, 6=Ultra, 7=Focus
 _af_settle_s = 0.1                     # settle time between focus moves (seconds)
 _af_offset = 0                         # focus offset applied after sweep (compensates scoring bias)
 _af_batch_count = 1                    # how many randomize+autofocus runs to do in sequence
 _af_fft_sigma = 1.0                    # FFT angular prominence threshold (in std devs)
+_af_tag = ""                           # user tag for labeling runs
+_af_oled_target_pct = 25               # target OLED width as % of frame width
+_af_final_zoom = 150                   # actual zoom used (for slider sync on completion)
 _NORM_SIZE = (64, 32)                  # fixed crop size (w, h) for scale invariance
 _LAPLACIAN_DIVISOR = 25000.0           # tuned for 64x32 CLAHE-normalized OLED crop (bumped to avoid saturation at 1.0)
 _EDGE_MARGIN_PX = 2                    # bbox within this of frame edge = clipped
@@ -294,7 +301,7 @@ nav a.active { border-bottom: 2px solid #0f0; }
 .af-progress { color: #0ff; font-size: 0.8rem; min-height: 1.4em; margin-top: 6px; font-family: 'JetBrains Mono', monospace; }
 .af-progress:empty { display: none; }
 .stage-bar { display: flex; align-items: center; margin: 10px 0 4px; gap: 0; }
-.stage-node { display: flex; flex-direction: column; align-items: center; min-width: 56px; }
+.stage-node { display: flex; flex-direction: column; align-items: center; min-width: 48px; }
 .stage-dot {
     width: 14px; height: 14px; border-radius: 50%;
     border: 2px solid #333; background: #222;
@@ -390,6 +397,18 @@ def main_buttons():
             ),
             cls="btn-row",
         ),
+        Div(
+            Label("Tag ", fr="af_tag", style="color:#888;font-size:0.8rem;"),
+            Input(
+                type="text", id="af_tag", name="value",
+                value=_af_tag, placeholder="e.g. dim-30cm",
+                hx_post="/ctrl/af_tag", hx_trigger="change",
+                hx_swap="none",
+                style="background:#1a1a1a;color:#0f0;border:1px solid #333;border-radius:4px;"
+                      "padding:4px 8px;font-family:monospace;font-size:0.8rem;width:200px;",
+            ),
+            style="margin-top:6px;display:flex;align-items:center;gap:8px;",
+        ),
         Div(id="status", cls="status"),
     )
 
@@ -430,6 +449,7 @@ def index():
     offset = _af_offset
     batch = _af_batch_count
     fft_sigma_10x = int(_af_fft_sigma * 10)
+    oled_target = _af_oled_target_pct
     return (
         Title("ESP Camera"),
         Style(CSS),
@@ -461,6 +481,7 @@ def index():
                             ("Focus Offset", "af_offset", -20, 20, 1, offset),
                             ("Batch Runs", "af_batch", 1, 30, 1, batch),
                             ("FFT σ (×10)", "af_fft_sigma", 5, 30, 1, fft_sigma_10x),
+                            ("OLED Target %", "af_oled_target", 10, 50, 5, oled_target),
                         ]),
                         ctrl_group("Image", IMAGE_CTRLS),
                         ctrl_group("Exposure", EXPOSURE_CTRLS),
@@ -519,6 +540,20 @@ async def ctrl_af_batch(value: int):
 async def ctrl_af_fft_sigma(value: int):
     global _af_fft_sigma
     _af_fft_sigma = max(5, min(30, value)) / 10.0
+    return Response(status_code=204)
+
+
+@rt("/ctrl/af_oled_target")
+async def ctrl_af_oled_target(value: int):
+    global _af_oled_target_pct
+    _af_oled_target_pct = max(10, min(50, value))
+    return Response(status_code=204)
+
+
+@rt("/ctrl/af_tag")
+async def ctrl_af_tag(value: str = ""):
+    global _af_tag
+    _af_tag = value.strip()[:50]
     return Response(status_code=204)
 
 
@@ -584,10 +619,14 @@ def _save_af_photo(frame: np.ndarray, ts: int, suffix: str, fmt: str = "jpg") ->
 
 def _capture_frame() -> np.ndarray:
     """Capture a fresh frame from the shared camera (discards 2 buffered frames)."""
-    with cam.lock:
+    if not cam.lock.acquire(timeout=10):
+        raise RuntimeError("Camera lock timeout — read may be hung")
+    try:
         cam.cap.read()
         cam.cap.read()
         ok, frame = cam.cap.read()
+    finally:
+        cam.lock.release()
     if not ok:
         raise RuntimeError("Capture failed")
     return frame
@@ -839,10 +878,10 @@ def _laplacian_score(frame: np.ndarray, bbox) -> float:
     lap = cv2.Laplacian((crop * 255).astype(np.uint8), cv2.CV_64F)
     return min(float(lap.var()) / _LAPLACIAN_DIVISOR, 1.0)
 
-_STAGE_NAMES = ["Scramble", "Detect", "Coarse", "Fine", "Ultra", "Focus"]
+_STAGE_NAMES = ["Scramble", "Detect", "Locate", "Coarse", "Fine", "Ultra", "Focus"]
 
 def _stage_html(current: int):
-    """Render a 6-stage pipeline graphic. current: 1–6 (active), 0=idle."""
+    """Render a 7-stage pipeline graphic. current: 1–7 (active), 0=idle."""
     nodes = []
     for i, name in enumerate(_STAGE_NAMES, 1):
         if i < current:
@@ -878,7 +917,7 @@ def _af_panel_current():
 
 def _run_autofocus(initial_values: dict, batch: int = 1):
     """Background thread: coarse-to-fine autofocus with Laplacian scoring."""
-    global _af_running, _af_log, _af_final_focus, _af_progress, _af_stage
+    global _af_running, _af_log, _af_final_focus, _af_progress, _af_stage, _af_final_zoom
     _af_log = []
     _af_final_focus = None
     _af_progress = ""
@@ -910,10 +949,10 @@ def _run_autofocus(initial_values: dict, batch: int = 1):
         pre_frame = _capture_frame()
         _save_af_photo(pre_frame, af_ts, "pre")
         _af_stage = 2  # Detect
-        # Restore everything except focus — leave focus as the variable
-        log("Restoring camera preset (keeping random focus)...")
+        # Restore everything except focus — start at zoom=100 for wide view
+        log("Restoring camera preset (wide view, zoom=100)...")
         restore = {
-            "zoom_absolute": 150, "pan_absolute": 0, "tilt_absolute": 0,
+            "zoom_absolute": 100, "pan_absolute": 0, "tilt_absolute": 0,
             "focus_automatic_continuous": 0, "sharpness": 180,
             "brightness": 128, "contrast": 128, "saturation": 128,
             "gain": 0, "backlight_compensation": 0,
@@ -924,9 +963,76 @@ def _run_autofocus(initial_values: dict, batch: int = 1):
             cam.set_ctrl(name, val)
         time.sleep(1.2)  # settle for zoom motor + image pipeline
 
-        # --- Pass 1: find focus center ---
+        # --- Locate: auto-zoom to target OLED size ---
+        _af_stage = 3  # Locate
+        progress("Locating OLED...")
+        target_frac = _af_oled_target_pct / 100.0
+        locate_zoom = 100  # will be updated if OLED found
+
+        # Step A — Wide detect at zoom=100
+        cam.set_ctrl("focus_absolute", 30)
+        time.sleep(_af_settle_s)
+        frame = _capture_frame()
+        oled_wide = _find_oled_rect(frame)
+
+        if oled_wide:
+            ox, oy, ow, oh = oled_wide
+            current_frac = ow / CAM_W
+            log(f"  OLED detected at zoom=100: {ow}x{oh} ({current_frac*100:.0f}% of frame)", "af-good")
+
+            # Step B — Calculate zoom
+            if current_frac >= target_frac * 0.8:
+                log(f"  Already ≥80% of target ({_af_oled_target_pct}%), keeping zoom=100", "af-info")
+                locate_zoom = 100
+            else:
+                desired_zoom = int(100 * target_frac / current_frac)
+                locate_zoom = max(100, min(450, desired_zoom))
+                log(f"  Zooming to {locate_zoom} (target {_af_oled_target_pct}% of frame)", "af-info")
+                cam.set_ctrl("zoom_absolute", locate_zoom)
+                restore["zoom_absolute"] = locate_zoom
+                time.sleep(1.2)
+
+                # Step C — Verify at new zoom
+                progress("Verifying zoom...")
+                frame = _capture_frame()
+                oled_verify = _find_oled_rect(frame)
+                if oled_verify:
+                    if _check_bbox_clipping(frame, oled_verify):
+                        backoff = int(locate_zoom * 0.8)
+                        log(f"  OLED clips frame edge, backing off to {backoff}", "af-warn")
+                        locate_zoom = backoff
+                        cam.set_ctrl("zoom_absolute", locate_zoom)
+                        restore["zoom_absolute"] = locate_zoom
+                        time.sleep(1.2)
+                    else:
+                        vx, vy, vw, vh = oled_verify
+                        log(f"  Verified at zoom={locate_zoom}: {vw}x{vh} ({vw/CAM_W*100:.0f}% of frame)", "af-good")
+                else:
+                    log(f"  OLED lost at zoom={locate_zoom}, falling back to 150", "af-warn")
+                    locate_zoom = 150
+                    cam.set_ctrl("zoom_absolute", locate_zoom)
+                    restore["zoom_absolute"] = locate_zoom
+                    time.sleep(1.2)
+        else:
+            # Step D — Fallback: try zoom=150
+            log("  OLED not found at zoom=100, trying zoom=150...", "af-warn")
+            locate_zoom = 150
+            cam.set_ctrl("zoom_absolute", locate_zoom)
+            restore["zoom_absolute"] = locate_zoom
+            time.sleep(1.2)
+            frame = _capture_frame()
+            oled_fallback = _find_oled_rect(frame)
+            if oled_fallback:
+                ox, oy, ow, oh = oled_fallback
+                log(f"  OLED found at zoom=150: {ow}x{oh} ({ow/CAM_W*100:.0f}% of frame)", "af-good")
+            else:
+                log("  OLED not found at zoom=150, using center crop fallback", "af-warn")
+
+        _af_final_zoom = locate_zoom
+
+        # --- Find focus center ---
         progress("Finding focus center...")
-        log("Finding focus center at focus=30...")
+        log(f"Finding focus center at zoom={locate_zoom}, focus=30...")
         cam.set_ctrl("focus_absolute", 30)
         time.sleep(_af_settle_s)
         frame = _capture_frame()
@@ -934,7 +1040,7 @@ def _run_autofocus(initial_values: dict, batch: int = 1):
         log(f"  Focus center: ({focus_cx}, {focus_cy})", "af-good")
 
         # Coarse sweep — every 20 steps across full range, 3-frame avg
-        _af_stage = 3  # Coarse
+        _af_stage = 4  # Coarse
         bbox = _make_crop_bbox(focus_cx, focus_cy, _CROP_COARSE, frame.shape)
         log("")
         log(f"--- Coarse sweep (3-frame avg, {_CROP_COARSE}x{_CROP_COARSE} crop) ---", "af-header")
@@ -963,7 +1069,7 @@ def _run_autofocus(initial_values: dict, batch: int = 1):
 
         if not bail_to_ultra:
             # Fine sweep — ±15 around best, step 5, 5-frame avg
-            _af_stage = 4  # Fine
+            _af_stage = 5  # Fine
             bbox = _make_crop_bbox(focus_cx, focus_cy, _CROP_FINE, frame.shape)
             log("")
             log(f"--- Fine sweep (5-frame avg, {_CROP_FINE}x{_CROP_FINE} crop) ---", "af-header")
@@ -1015,7 +1121,7 @@ def _run_autofocus(initial_values: dict, batch: int = 1):
             log(f"  * best: focus={best_pos} (score={best_score:.4f})", "af-good")
 
         # Ultra sweep — ±2 around best, step 1, 5-frame avg (always runs)
-        _af_stage = 5  # Ultra
+        _af_stage = 6  # Ultra
         bbox = _make_crop_bbox(focus_cx, focus_cy, _CROP_ULTRA, frame.shape)
         log("")
         log(f"--- Ultra sweep (5-frame avg, step 1, {_CROP_ULTRA}x{_CROP_ULTRA} crop) ---", "af-header")
@@ -1078,7 +1184,7 @@ def _run_autofocus(initial_values: dict, batch: int = 1):
             bbox = _make_crop_bbox(focus_cx, focus_cy, _CROP_ULTRA, frame.shape)
 
         # Verify — 5-frame avg
-        _af_stage = 6  # Focus
+        _af_stage = 7  # Focus
         progress("Verifying...")
         log("")
         log("--- Verify (5-frame avg) ---", "af-header")
@@ -1100,6 +1206,7 @@ def _run_autofocus(initial_values: dict, batch: int = 1):
         # Save metadata JSON
         meta = {
             "timestamp": af_ts,
+            "tag": _af_tag or None,
             "settle_ms": int(_af_settle_s * 1000),
             "initial": initial_values,
             "final": {
@@ -1115,6 +1222,8 @@ def _run_autofocus(initial_values: dict, batch: int = 1):
                 "micro": _CROP_MICRO, "ultra": _CROP_ULTRA,
             },
             "oled_bbox": {"x": bx, "y": by, "w": bw, "h": bh},
+            "oled_target_pct": _af_oled_target_pct,
+            "locate_zoom": locate_zoom,
         }
         (PHOTOS_DIR / f"{af_ts}_meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -1236,7 +1345,7 @@ async def autofocus_status():
 
     # Done — unlock UI + sync sliders for all restored settings + final focus
     final_values = {
-        "zoom_absolute": 150, "pan_absolute": 0, "tilt_absolute": 0,
+        "zoom_absolute": _af_final_zoom, "pan_absolute": 0, "tilt_absolute": 0,
         "focus_automatic_continuous": 0, "sharpness": 180,
         "brightness": 128, "contrast": 128, "saturation": 128,
         "gain": 0, "backlight_compensation": 0,
@@ -1305,14 +1414,20 @@ def photos_page():
             except Exception:
                 pass
         meta_info = ""
+        tag = ""
         if meta:
             f_val = meta.get("final", {}).get("focus_absolute", "?")
             f_score = meta.get("final", {}).get("score", "?")
             meta_info = f"focus={f_val}  score={f_score}"
+            tag = meta.get("tag") or ""
         drawer_id = f"card-{ts_str}"
         cards.append(
             Div(
-                Div(f"#{ts_str}", style="color:#0a0;font-size:0.85rem;font-weight:bold;"),
+                Div(
+                    f"#{ts_str}",
+                    Span(f"  {tag}", style="color:#0ff;font-size:0.8rem;font-weight:normal;") if tag else "",
+                    style="color:#0a0;font-size:0.85rem;font-weight:bold;",
+                ),
                 Div(
                     Span(date_str, style="color:#666;font-size:0.75rem;"),
                     Span(f"  {meta_info}", style="color:#0f0;font-size:0.75rem;") if meta_info else "",
